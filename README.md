@@ -1,15 +1,16 @@
 # agy-quota.wezterm
 
-面向 WezTerm 的 Google Antigravity (`agy`) 实时配额与上下文状态栏插件：支持**底部状态/标签栏 (`tab_bar_at_bottom = true`)**，在当前 Pane 运行 `agy` 时动态展示 **配额池 (`Gemini` / `Claude/GPT`)**、**Prompt 缓存命中率 (`Cached`)**、**上下文用量 (`Context`)**、**5 小时配额 (`5h`)** 与 **每周配额 (`Wk`)**，在普通 Shell Pane 中**完全隐藏**（仅保留用户原有的目录与时钟），并与 Antigravity CLI 原生界面及 `settings.json` 完全共存。
+面向 WezTerm 的 Google Antigravity (`agy`) 实时配额与上下文状态栏插件：采用**双项目协作架构**——由 `wezterm-custom` 提供原生 `bottom_status_rows = 2` 与 `window:set_bottom_status` 底部双行槽位，`agy-quota.wezterm` 自动探测该 API 并在当前 Pane 运行 `agy` 时在底部透明双行区展示 **Cached / Context**（第 1 行）与 **配额池 (`Gemini` / `Claude/GPT`) / `Five Hours` / `Weekly`**（第 2 行），同时保持顶部标签栏、右上角窗口按钮及 `cwd` + 时钟；在普通 Shell Pane 中底部输出为空（`""`，保留透明背景），在原版 WezTerm 上则自动回退为顶部/底部单行 `window:set_right_status(...)`，并与 Antigravity CLI 原生 `statusLine` 及 `settings.json` 完全共存。
 
 ---
 
 ## 核心特性
 
-- **底部状态栏集成**：支持通过 `tab_bar_at_bottom = true` 将标签栏与右侧配额状态栏统一下置到底部，与 NieR 等深色主题配色自然融合。
-- **`agy` 专属可见性 (`only_when_agy = true`)**：仅当当前焦点 Pane 前台进程（或其子进程树）为 `agy` / `agy-cli` / `antigravity` 时显示状态段并触发刷新；在普通 Shell Pane 中插件输出为空，状态栏保持干净的 `cwd` + 时钟（也可设 `only_when_agy = false` 在所有 Pane 显示全局配额）。
+- **双项目拆分与原生底部双行栏 (`wezterm-custom`)**：`wezterm-custom` 负责渲染 `config.bottom_status_rows = 2` 底部独立状态槽位及 `window:set_bottom_status(ansi_text)`；插件通过 `has_bottom_status_api(window)` 自动识别，有该 API 时保留顶部标签栏 (`tab_bar_at_bottom = false`) 与右上角集成按钮，将双行指标渲染至底部，不在顶部重复堆叠配额。
+- **原版 WezTerm 优雅降级**：若运行在未打补丁的原版 WezTerm（无 `window.set_bottom_status`），`agy_quota.update_bottom_status(...)` 返回 `false`，自动回退到单行 `get_status_cells(...)` + `window:set_right_status(...)`（可按需设 `tab_bar_at_bottom = true` 或留在右上角）。
+- **`agy` 专属可见性 (`only_when_agy = true`)**：仅当当前焦点 Pane 前台进程（或其子进程树）为 `agy` / `agy-cli` / `antigravity` 时显示状态并触发刷新；在普通 Shell Pane 中底部状态返回 `""`（透明不占位），顶部状态栏保持干净的 `cwd` + 时钟（也可设 `only_when_agy = false` 在所有 Pane 显示全局配额）。
 - **动态模型感知切池 (`Gemini` ↔ `Claude/GPT`)**：实时跟踪用户在 CLI 中通过 `/model`、`--model` 参数或会话切换产生的模型变更——综合读取 `settings.json`（只读 `model` 字段并补偿 Linux `mtime` 滞后）、Antigravity Hooks 与 LS RPC 轨迹元数据时间戳，自动在 `Gemini` (`gemini`) 与 `Claude/GPT` (`3p`) 两个配额池之间切换显示对应百分比与倒计时。
-- **全档位保留进度条的三档自适应布局**：根据当前 Tab 宽度 (`tab:get_size().cols - cols_offset`) 在 `full` / `compact` / `minimal` 间自动切换；即便是默认的 105 列 `minimal` 模式下，仍保留 `5h` 与 `Wk` 的可视化进度条 (`minimal_bar_width = 4`)。
+- **跨终端会话键设计**：采集器与 Hook 桥接层 (`bin/lib/cache.mjs` `resolvePaneId`) 按 `显式 --pane` → `WEZTERM_PANE` → `WT_SESSION` (`wt_<id>`) → `default` 解析会话键，为后续扩展至 Windows Terminal 等终端复用同一套采集与缓存机制预留兼容层。
 - **零阻塞纯异步架构**：WezTerm 渲染主线程仅节流读取本地缓存 JSON（1s TTL）并在超时时后台派生 `node` 采集器，不阻塞终端渲染。
 
 ---
@@ -36,12 +37,12 @@
 
 ## 共存架构与动态切池（Hooks + Settings + LS RPC + SQLite）
 
-本插件**永不修改 `~/.gemini/antigravity-cli/settings.json`**（`statusLine` 保持原样），通过外部插件与独立缓存目录实现无冲突协同，并在 `agy` 运行期间实时跟踪 `/model` 切换：
+本插件**永不修改 `~/.gemini/antigravity-cli/settings.json`**（原生 `statusLine` 完全不被触碰或覆盖），通过外部插件、独立缓存目录与跨终端会话键（`WEZTERM_PANE` → `WT_SESSION` → `default`）实现无冲突协同，并在 `agy` 运行期间实时跟踪 `/model` 切换：
 
 ```text
 agy CLI 环境
   ├─▶ 1. agy-plugin Hooks (SessionStart / PreInvocation / PostInvocation / PostToolUse / Stop)
-  │        └─▶ hook-bridge.mjs ──▶ 记录会话 ID / Hook 模型 / LS 端点 (0600)
+  │        └─▶ hook-bridge.mjs ──▶ 按 resolvePaneId(WEZTERM_PANE / WT_SESSION / default) 记录会话与 LS 端点 (0600)
   ├─▶ 2. 只读 Settings 监控 (model-tracking.mjs)
   │        └─▶ 仅读取 settings.json 的 `model` 字段 + mtime 滞后补偿（支持 /model 即时切池）
   └─▶ 3. bin/agy-status-collector.mjs (--refresh)
@@ -53,7 +54,9 @@ agy CLI 环境
                                  │
                                  ▼ (时间戳裁决 hook > rpc > settings)
 WezTerm Lua (plugin/init.lua + state.lua + render.lua)
-  └─▶ 检测前景进程 (agy 时才渲染) ──▶ 节流读缓存 (1s) / 后台刷新 ──▶ 底部状态栏 window:set_right_status(...)
+  └─▶ 检测前景进程 (agy 时才渲染) ──▶ 节流读缓存 (1s) / 后台刷新
+        ├─▶ wezterm-custom (存在 set_bottom_status) ──▶ window:set_bottom_status(双行 ANSI) + 顶部仅 cwd/时钟
+        └─▶ 原版 WezTerm (回退) ──▶ window:set_right_status(单行 FormatItem + cwd/时钟)
 ```
 
 安全边界：
@@ -93,26 +96,45 @@ chmod +x /home/xiaolu/agy-quota.wezterm/install.sh
 
 ## WezTerm 配置与选项
 
-### 推荐配置（底部状态栏 + 仅 `agy` 显示 + 自定义 `cwd` / 时钟）
+### 推荐配置（顶部标签栏 + `wezterm-custom` 底部双行槽位 + 原版单行自动回退）
 
-在 `~/.config/wezterm/wezterm.lua` 中设置 `config.tab_bar_at_bottom = true`、关闭插件内置事件 (`register_status_event = false`)，并在统一的 `update-status` 中组合 `agy_quota.get_status_cells(window, pane)` 与个人状态段。当处于普通 Shell Pane（`#quota_cells == 0`）时，仅渲染正常 `cwd` 与时钟，不附带任何 `agy` 文字或多余分隔符。注意将 `agy_quota.apply_to_config(...)` 放在 `config.keys = { ... }` 之后，避免覆盖按键表：
+在 `~/.config/wezterm/wezterm.lua` 中保留顶部标签栏 (`config.tab_bar_at_bottom = false`) 与右上角窗口按钮，设置 `config.bottom_status_rows = 2` 并关闭插件内置事件 (`register_status_event = false`)；在统一的 `update-status` 中先调用 `agy_quota.update_bottom_status(window, target_pane)`：
+- 当 `used_bottom == true`（`wezterm-custom` 环境）时，双行配额/上下文由底部独立槽位渲染（非 `agy` Pane 返回 `""` 保持透明），右上角仅渲染 `cwd` 与时钟，避免重复；
+- 当 `used_bottom == false`（原版 WezTerm 回退）时，右上角自动组合单行 `quota_cells` + `cwd` + 时钟。注意将 `agy_quota.apply_to_config(...)` 放在 `config.keys = { ... }` 之后，避免覆盖按键表：
 
 ```lua
 local wezterm = require("wezterm")
 local agy_quota = wezterm.plugin.require("https://github.com/fan249720142-droid/agy-quota.wezterm")
 local config = wezterm.config_builder()
 
--- 底部标签栏与状态栏
+-- 顶部标签栏与 wezterm-custom 底部双行状态槽位
 config.use_fancy_tab_bar = false
-config.tab_bar_at_bottom = true
+config.tab_bar_at_bottom = false
+config.show_new_tab_button_in_tab_bar = true
+config.bottom_status_rows = 2
 
 -- ... 字体、配色、config.keys、config.mouse_bindings ...
 
 wezterm.on("update-status", function(window, pane)
-  local tab_cols = window:active_tab():get_size().cols
-  local quota_cells = agy_quota.get_status_cells(window, pane)
-  local has_quota = type(quota_cells) == "table" and #quota_cells > 0
+  local target_pane = pane
+  if not target_pane and window and type(window.active_pane) == "function" then
+    local ok, active = pcall(function()
+      return window:active_pane()
+    end)
+    if ok then
+      target_pane = active
+    end
+  end
 
+  local used_bottom = agy_quota.update_bottom_status(window, target_pane)
+  local quota_cells = nil
+  local has_quota = false
+  if not used_bottom then
+    quota_cells = agy_quota.get_status_cells(window, target_pane)
+    has_quota = type(quota_cells) == "table" and #quota_cells > 0
+  end
+
+  local tab_cols = window:active_tab():get_size().cols
   local show_cwd = (not has_quota) or (tab_cols >= 135)
   local cells = {}
 
@@ -128,7 +150,7 @@ wezterm.on("update-status", function(window, pane)
   end
 
   if show_cwd then
-    -- 普通 Shell Pane 或宽窗口 (>= 135 列) 时附带 cwd
+    -- 底部槽位启用、普通 Shell Pane 或宽窗口 (>= 135 列) 时附带 cwd
     -- ... 插入 cwd cell ...
   end
 
@@ -141,7 +163,8 @@ agy_quota.apply_to_config(config, {
   register_status_event = false,
   only_when_agy = true,
   show_pool = true,
-  tab_bar_at_bottom = true,
+  tab_bar_at_bottom = false,
+  prefer_bottom_status = true,
   toggle_layout_key = "q",
   refresh_key = "u",
   compact_bar_width = 4,
@@ -154,14 +177,16 @@ return config
 
 ### 独立模式（快速接入）
 
-若无自定义状态栏，可直接由插件托管 `update-status` 与底部放置：
+若无自定义状态栏，可直接由插件托管 `update-status`：在 `wezterm-custom` 下自动写入底部双行并将 `cwd`/时间置于右上角；在原版 WezTerm 下自动回退为单行状态栏（若希望在原版 WezTerm 中将单行栏下置，可将 `tab_bar_at_bottom` 设为 `true`）：
 
 ```lua
 local agy_quota = wezterm.plugin.require("https://github.com/fan249720142-droid/agy-quota.wezterm")
+config.bottom_status_rows = 2
 agy_quota.apply_to_config(config, {
   only_when_agy = true,
   show_pool = true,
-  tab_bar_at_bottom = true,
+  tab_bar_at_bottom = false,
+  prefer_bottom_status = true,
   toggle_layout_key = "q",
   refresh_key = "u",
   append_cwd = true,
@@ -175,7 +200,9 @@ agy_quota.apply_to_config(config, {
 | --- | --- | --- |
 | `layout` | `"auto"` | `"auto"` / `"full"` / `"compact"` / `"minimal"` |
 | `only_when_agy` | `true` | 仅在 `agy` / `agy-cli` / `antigravity` Pane 中渲染，普通 Shell Pane 完全隐藏 |
-| `tab_bar_at_bottom` | `nil` | 非 `nil` 时在 `apply_to_config` 中设置 `config.tab_bar_at_bottom`（推荐 `true`） |
+| `prefer_bottom_status` | `true` | 当窗口存在 `set_bottom_status`（`wezterm-custom`）时优先渲染到底部双行槽位 |
+| `render_mode` | `"auto"` | `"auto"` / `"top"`；设为 `"top"` 可强制使用单行顶部状态栏 |
+| `tab_bar_at_bottom` | `nil` | 非 `nil` 时在 `apply_to_config` 中设置 `config.tab_bar_at_bottom`（`wezterm-custom` 推荐 `false`，原版单行可设 `true`） |
 | `default_cols` | `105` | 无法取得 Tab/Pane 宽度时的回退列数 |
 | `cols_offset` | `0` | 计算布局前扣除的预留列宽（标签页/按钮/时钟占位，推荐 `18`） |
 | `full_min_cols` | `140` | 有效列宽 `>= full_min_cols` 启用 `full`（`cols_offset=18` 时即 Tab >= 158 列） |
@@ -183,6 +210,9 @@ agy_quota.apply_to_config(config, {
 | `full_bar_width` | `8` | `full` 模式下进度条字符宽度 |
 | `compact_bar_width` | `4` | `compact` 模式下进度条字符宽度 |
 | `minimal_bar_width` | `4` | `minimal` 模式下 `5h` / `Wk` 进度条字符宽度（保留进度条展示） |
+| `bottom_bar_width` | `10` | `wezterm-custom` 底部双行标准模式进度条宽度 |
+| `bottom_compact_bar_width` | `4` | `wezterm-custom` 底部双行紧凑模式（`effective < bottom_compact_cols`）进度条宽度 |
+| `bottom_compact_cols` | `85` | 底部双行触发紧凑标签的阈值列数（默认 105 列、`cols_offset=18` 时为 `87 >= 85`，可完整显示） |
 | `separator` | `" │ "` | 指标段之间的分隔符 |
 | `hide_context_outside_agy` | `true` | `only_when_agy = false` 时，在非 `agy` 进程隐藏 `Cached` 与 `Context` |
 | `hide_when_empty` | `false` | 无配额与上下文数据时隐藏整个状态段 |
@@ -200,6 +230,17 @@ agy_quota.apply_to_config(config, {
 | `colors` | `{ ... }` | 覆盖 `label` / `tokens` / `separator` / `countdown` / `bar_empty` / `muted` / `pool` / `pool_gemini` (`#89b4fa`) / `pool_3p` (`#d4bdf5`) |
 
 ### 自适应布局格式对比
+
+#### `wezterm-custom` 底部双行模式（`window:set_bottom_status`）
+
+```text
+# Line 1: Cached 97.6% │ Context 37.7% ████░░░░░░ 395.4k/1.0M
+# Line 2: Gemini │ Five Hours 59% ██████░░░░ 3h53m │ Weekly 86% █████████░ 6d0h
+```
+
+当 `is_agy == false`（普通 Shell Pane）且 `only_when_agy = true` 时，返回空字符串 `""`，底部 2 行保持透明无文字。
+
+#### 原版 WezTerm 单行回退模式（`window:set_right_status`）
 
 以 `cols_offset = 18`、`show_pool = true`、`compact_bar_width = 4`、`minimal_bar_width = 4` 为例：
 
