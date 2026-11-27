@@ -119,6 +119,9 @@ local function make_mock_pane(opts)
   function pane:get_foreground_process_name()
     return opts.proc_name
   end
+  function pane:get_tty_name()
+    return opts.tty_name
+  end
   return pane
 end
 
@@ -1296,6 +1299,130 @@ test("feature-detected dual mode routes to set_bottom_status on wezterm-custom a
     wezterm.emit("update-status", stock_win, agy_pane)
     assert_true(stock_win._last_right_status:find("Gemini", 1, true) ~= nil, "stock_win falls back to single-line right status")
     assert_true(stock_win._last_right_status:find("5h ", 1, true) ~= nil and stock_win._last_right_status:find("49%%") ~= nil, "stock_win right status includes 5h 49%")
+  end)
+  remove_dir(tmp_dir)
+  if not ok then
+    error(err)
+  end
+end)
+
+test("agy_pid, tty forwarding, PID-change forced refresh, and initial 0-usage rendering", function()
+  local tmp_dir = make_temp_dir()
+  local ok, err = pcall(function()
+    state.reset()
+    local spawns = {}
+    local opts = {
+      cache_dir = tmp_dir,
+      node_bin = "/usr/local/bin/node",
+      collector_script = "/opt/agy/bin/agy-status-collector.mjs",
+      spawn_fn = function(argv)
+        table.insert(spawns, argv)
+      end,
+    }
+
+    local live_proc = {
+      pid = 1000,
+      executable = "/bin/zsh",
+      name = "zsh",
+      children = {
+        [1] = {
+          pid = 372482,
+          executable = "/home/xiaolu/.local/bin/agy",
+          name = "agy",
+          children = {},
+        },
+      },
+    }
+    local pane = make_mock_pane({
+      id = 91,
+      cols = 120,
+      cwd = "/home/xiaolu/project",
+      tty_name = "/dev/pts/4",
+      proc_info = live_proc,
+    })
+
+    assert_eq(state.get_pane_tty(pane), "/dev/pts/4", "get_pane_tty reads tty_name")
+    assert_eq(state.get_agy_pid(pane, opts, 5000), 372482, "get_agy_pid captures nested agy pid")
+
+    -- Initial spawn passes --agy-pid and --tty
+    local s1 = state.get_snapshot(pane, opts, 5000)
+    assert_eq(s1.agy_pid, 372482, "snapshot falls back to live agy_pid when pane json absent")
+    assert_eq(#spawns, 1, "initial missing cache spawns refresh")
+    local joined = table.concat(spawns[1], " ")
+    assert_true(joined:find("--agy-pid 372482", 1, true) ~= nil, "argv includes --agy-pid 372482")
+    assert_true(joined:find("--tty /dev/pts/4", 1, true) ~= nil, "argv includes --tty /dev/pts/4")
+
+    -- Write fresh quota.json and pane_91.json with agy_pid = 100 (different from live 200)
+    write_file(
+      tmp_dir .. "/quota.json",
+      '{"version":1,"fetched_at":5001,"default_pool":"gemini","pools":{"gemini":{"label":"Gemini","five_hour":{"remaining_pct":49,"reset_epoch":9861},"weekly":{"remaining_pct":86,"reset_epoch":595401}}}}'
+    )
+    write_file(
+      tmp_dir .. "/panes/pane_91.json",
+      '{"version":1,"pane_id":91,"agy_pid":100,"conversation_id":"conv-old","pool":"gemini","context":{"source":"initial","used_tokens":0,"context_window_size":1048576,"used_pct":0,"cached_pct":0},"updated_at":5001}'
+    )
+
+    -- Update live pid to 100 first (matching disk agy_pid = 100) after proc_cache TTL expires
+    live_proc.children[1].pid = 100
+    local s_same = state.get_snapshot(pane, opts, 5002.5)
+    assert_eq(s_same.pane_stale, false, "matching agy_pid and fresh updated_at is not stale")
+    assert_eq(s_same.agy_pid, 100, "snapshot carries pane_data.agy_pid")
+    assert_eq(s_same.conversation_id, "conv-old", "snapshot carries pane_data.conversation_id")
+    assert_eq(#spawns, 1, "no spawn when pid matches and fresh")
+
+    -- Now simulate /resume or restarting agy in the same pane with new pid 200 within 1s (< cooldown & < active_poll_interval)
+    live_proc.children[1].pid = 200
+    -- Expire proc_cache TTL (2s from 5002.5 -> 5004.5, while updated_at=5001? Wait: make updated_at=5004 so NOT time-stale!)
+    write_file(
+      tmp_dir .. "/panes/pane_91.json",
+      '{"version":1,"pane_id":91,"agy_pid":100,"conversation_id":"conv-old","pool":"gemini","context":{"source":"initial","used_tokens":0,"context_window_size":1048576,"used_pct":0,"cached_pct":0},"updated_at":5004}'
+    )
+    -- Seed pane_cache at 5004 with pid=100
+    live_proc.children[1].pid = 100
+    -- Reset last_spawn_at via a forced refresh at 5003.5 so cooldown (2s) would block normal spawn at 5004.5!
+    state.trigger_refresh(pane, opts, 5003.5)
+    assert_eq(#spawns, 2, "trigger_refresh spawned")
+    local s_seeded = state.get_snapshot(pane, opts, 5004)
+    assert_eq(s_seeded.pane_stale, false, "seeded fresh pane cache at 5004")
+
+    -- At 5004.5, reset proc_cache only (via time >= proc_cache_ttl=2? Wait: seeded proc_cache at 5002.5, so at 5004.5 proc_cache expired, while pane_cache from 5004 is < 1s old and updated_at=5004 is < 3s old, AND last_spawn_at=5003.5 is < 2s cooldown!)
+    live_proc.children[1].pid = 200
+    local s_pid_changed = state.get_snapshot(pane, opts, 5004.5)
+    assert_eq(s_pid_changed.pane_stale, true, "PID change marks pane_stale = true immediately")
+    assert_eq(#spawns, 3, "PID change forces immediate refresh bypassing cooldown")
+    local joined_pid200 = table.concat(spawns[3], " ")
+    assert_true(joined_pid200:find("--agy-pid 200", 1, true) ~= nil, "forced spawn forwards new --agy-pid 200")
+
+    -- Write updated pane_91.json and confirm invalidated pane_cache allows immediate read even within 1s (5004.8)
+    write_file(
+      tmp_dir .. "/panes/pane_91.json",
+      '{"version":1,"pane_id":91,"agy_pid":200,"conversation_id":"conv-new","pool":"gemini","context":{"source":"initial","used_tokens":0,"context_window_size":1048576,"used_pct":0,"cached_pct":0},"updated_at":5004.8}'
+    )
+    local s_reloaded = state.get_snapshot(pane, opts, 5004.8)
+    assert_eq(s_reloaded.agy_pid, 200, "invalidated pane_cache immediately reloads new agy_pid")
+    assert_eq(s_reloaded.conversation_id, "conv-new", "invalidated pane_cache immediately reloads new conversation_id")
+
+    -- Initial 0-usage context rendering in bottom lines & text
+    local lines_init = render.render_bottom_lines(s_reloaded, 120, {})
+    assert_eq(
+      render.cells_to_plain_text(lines_init.line1),
+      "Cached 0.0% │ Context 0.0% ░░░░░░░░░░ 0/1.0M",
+      "initial 0-usage context renders Cached 0.0% | Context 0.0% empty bar 0/1.0M"
+    )
+    local bottom_init_text = render.render_bottom_text(s_reloaded, 120, {})
+    assert_true(bottom_init_text:find("Cached ", 1, true) ~= nil and bottom_init_text:find("0.0%", 1, true) ~= nil, "render_bottom_text contains initial 0.0%")
+
+    -- Verify Cached 0.0% uses colors.muted (#6c7386) when source=='initial' & 0 tokens, while cached_color(0) stays #ff5555
+    local cached_val_color = nil
+    for i = 1, #lines_init.line1 - 1 do
+      local item = lines_init.line1[i]
+      if item.Foreground and lines_init.line1[i + 1].Text == "0.0%" then
+        cached_val_color = item.Foreground.Color
+        break
+      end
+    end
+    assert_eq(cached_val_color, render.DEFAULTS.colors.muted, "initial 0-usage Cached 0.0% uses muted color")
+    assert_eq(render.cached_color(0), "#ff5555", "render.cached_color(0) remains #ff5555")
   end)
   remove_dir(tmp_dir)
   if not ok then

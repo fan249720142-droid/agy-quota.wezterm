@@ -397,12 +397,14 @@ end
 
 local function proc_tree_matches_agy(info, agy_set, visited, depth)
   if type(info) ~= "table" or depth > 16 or visited[info] then
-    return false
+    return false, nil
   end
   visited[info] = true
 
+  local node_pid = type(info.pid) == "number" and info.pid or nil
+
   if matches_agy_name_or_arg(info.name, agy_set) or matches_agy_name_or_arg(info.executable, agy_set) then
-    return true
+    return true, node_pid
   end
 
   local base_name = path_basename(info.name or "")
@@ -414,7 +416,7 @@ local function proc_tree_matches_agy(info, agy_set, visited, depth)
       local arg = info.argv[i]
       if type(arg) == "string" and not is_excluded_script(arg) then
         if matches_agy_name_or_arg(arg, agy_set) then
-          return true
+          return true, node_pid
         end
       end
     end
@@ -422,13 +424,14 @@ local function proc_tree_matches_agy(info, agy_set, visited, depth)
 
   if type(info.children) == "table" then
     for _, child in pairs(info.children) do
-      if proc_tree_matches_agy(child, agy_set, visited, depth + 1) then
-        return true
+      local matched, child_pid = proc_tree_matches_agy(child, agy_set, visited, depth + 1)
+      if matched then
+        return true, child_pid
       end
     end
   end
 
-  return false
+  return false, nil
 end
 
 local function prune_stale_panes(now, ttl)
@@ -490,12 +493,29 @@ function M.get_pane_cwd(pane)
   return ""
 end
 
---- Detect whether the foreground process tree of `pane` is running `agy`.
+--- Read TTY device path of `pane` if supported by WezTerm.
+function M.get_pane_tty(pane)
+  if pane == nil then
+    return nil
+  end
+  local ok, tty = pcall(function()
+    if type(pane.get_tty_name) == "function" then
+      return pane:get_tty_name()
+    end
+    return nil
+  end)
+  if ok and type(tty) == "string" and tty ~= "" then
+    return tty
+  end
+  return nil
+end
+
+--- Detect whether the foreground process tree of `pane` is running `agy`, returning `(is_agy, agy_pid)`.
 function M.detect_is_agy(pane, opts, now)
   opts = opts or M.DEFAULTS
   now = now or os.time()
   if pane == nil then
-    return false
+    return false, nil
   end
 
   local pane_id = M.get_pane_id(pane)
@@ -505,7 +525,7 @@ function M.detect_is_agy(pane, opts, now)
   if pane_id ~= nil then
     local cached = runtime_state.proc_cache[pane_id]
     if cached and (now - cached.checked_at) < ttl then
-      return cached.is_agy
+      return cached.is_agy, cached.agy_pid
     end
   end
 
@@ -520,6 +540,7 @@ function M.detect_is_agy(pane, opts, now)
   end
 
   local is_agy = false
+  local matched_pid = nil
   if type(opts.is_agy_matcher) == "function" then
     local ok_m, matched = pcall(opts.is_agy_matcher, pane, proc_info)
     if ok_m then
@@ -528,7 +549,7 @@ function M.detect_is_agy(pane, opts, now)
   else
     local agy_set = build_agy_name_set(opts)
     if type(proc_info) == "table" then
-      is_agy = proc_tree_matches_agy(proc_info, agy_set, {}, 1)
+      is_agy, matched_pid = proc_tree_matches_agy(proc_info, agy_set, {}, 1)
     end
     if not is_agy then
       local ok_name, proc_name = pcall(function()
@@ -543,13 +564,24 @@ function M.detect_is_agy(pane, opts, now)
     end
   end
 
+  local agy_pid = is_agy and matched_pid or nil
   if pane_id ~= nil then
     runtime_state.proc_cache[pane_id] = {
       is_agy = is_agy,
+      agy_pid = agy_pid,
       checked_at = now,
     }
   end
-  return is_agy
+  return is_agy, agy_pid
+end
+
+--- Return the cached or detected `agy` process PID in `pane`, or `nil` if inactive/unavailable.
+function M.get_agy_pid(pane, opts, now)
+  local is_agy, agy_pid = M.detect_is_agy(pane, opts, now)
+  if not is_agy then
+    return nil
+  end
+  return agy_pid
 end
 
 local function read_quota_cached(cache_dir, opts, now, force)
@@ -746,7 +778,7 @@ local function normalize_context(pane_data)
   }
 end
 
-function M.spawn_refresh(pane_id, cwd, opts, now, force)
+function M.spawn_refresh(pane_id, cwd, opts, now, force, extra)
   opts = opts or M.DEFAULTS
   now = now or os.time()
 
@@ -774,6 +806,16 @@ function M.spawn_refresh(pane_id, cwd, opts, now, force)
     table.insert(argv, "--cwd")
     table.insert(argv, cwd)
   end
+  if type(extra) == "table" then
+    if extra.agy_pid ~= nil then
+      table.insert(argv, "--agy-pid")
+      table.insert(argv, tostring(extra.agy_pid))
+    end
+    if type(extra.tty) == "string" and extra.tty ~= "" then
+      table.insert(argv, "--tty")
+      table.insert(argv, extra.tty)
+    end
+  end
 
   runtime_state.last_spawn_at = now
   local spawner = use_custom_spawner and opts.spawn_fn or wezterm.background_child_process
@@ -789,10 +831,21 @@ function M.get_snapshot(pane, opts, now, force)
   local cache_dir = M.resolve_cache_dir(opts)
   local pane_id = M.get_pane_id(pane)
   local cwd = M.get_pane_cwd(pane)
-  local is_agy = M.detect_is_agy(pane, opts, now)
+  local is_agy, agy_pid = M.detect_is_agy(pane, opts, now)
+  local tty = M.get_pane_tty(pane)
 
   local quota_data = read_quota_cached(cache_dir, opts, now, force)
   local pane_data = read_pane_cached(cache_dir, pane_id, opts, now, force)
+
+  local pid_changed = false
+  if is_agy and agy_pid ~= nil and type(pane_data) == "table" and pane_data.agy_pid ~= nil then
+    if tonumber(pane_data.agy_pid) ~= tonumber(agy_pid) then
+      pid_changed = true
+      if pane_id ~= nil then
+        runtime_state.pane_cache[pane_id] = nil
+      end
+    end
+  end
 
   local quota_ts = quota_data and M.parse_epoch(quota_data.fetched_at) or nil
   local poll_interval = opts.poll_interval_secs or 30
@@ -802,12 +855,12 @@ function M.get_snapshot(pane, opts, now, force)
   local active_interval = opts.active_poll_interval_secs or 3
   local pane_stale = false
   if is_agy and pane_id ~= nil then
-    pane_stale = (pane_data == nil) or (pane_ts == nil) or ((now - pane_ts) >= active_interval)
+    pane_stale = pid_changed or (pane_data == nil) or (pane_ts == nil) or ((now - pane_ts) >= active_interval)
   end
 
   local allow_spawn = (force == true) or (is_agy == true) or (opts.only_when_agy == false)
   if allow_spawn and (force or quota_stale or pane_stale) then
-    M.spawn_refresh(pane_id, cwd, opts, now, force)
+    M.spawn_refresh(pane_id, cwd, opts, now, force or pid_changed, { agy_pid = agy_pid, tty = tty })
   end
 
   local pool_key, pool_data = M.resolve_pool(quota_data, pane_data, opts)
@@ -830,6 +883,8 @@ function M.get_snapshot(pane, opts, now, force)
     pane_id = pane_id,
     cwd = cwd,
     is_agy = is_agy,
+    agy_pid = pane_data and pane_data.agy_pid or agy_pid,
+    conversation_id = pane_data and pane_data.conversation_id or nil,
     has_quota = (quota_data ~= nil),
     has_pane = (pane_data ~= nil),
     quota_stale = quota_stale,
@@ -856,11 +911,13 @@ function M.trigger_refresh(pane, opts, now)
   now = now or os.time()
   local pane_id = M.get_pane_id(pane)
   local cwd = M.get_pane_cwd(pane)
+  local agy_pid = M.get_agy_pid(pane, opts, now)
+  local tty = M.get_pane_tty(pane)
   runtime_state.quota_cache = nil
   if pane_id ~= nil then
     runtime_state.pane_cache[pane_id] = nil
   end
-  return M.spawn_refresh(pane_id, cwd, opts, now, true)
+  return M.spawn_refresh(pane_id, cwd, opts, now, true, { agy_pid = agy_pid, tty = tty })
 end
 
 function M.reset()

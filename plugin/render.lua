@@ -386,8 +386,12 @@ end
 local function add_context_segments(segments, ctx, cfg, bar_width, bar_opts, colors)
   if cfg.show_cache and ctx.cached_pct ~= nil then
     add_segment(segments, function(seg)
+      local is_initial_zero = (ctx.source == "initial")
+        and (ctx.cached_pct == 0)
+        and ((ctx.used_tokens or 0) == 0)
+      local cache_col = is_initial_zero and colors.muted or M.cached_color(ctx.cached_pct)
       push_text(seg, colors.label, cfg.cache_label .. " ")
-      push_text(seg, M.cached_color(ctx.cached_pct), format_pct(ctx.cached_pct, cfg.cache_decimals))
+      push_text(seg, cache_col, format_pct(ctx.cached_pct, cfg.cache_decimals))
     end)
   end
 
