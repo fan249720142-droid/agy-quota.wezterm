@@ -1,0 +1,728 @@
+local wezterm = require("wezterm")
+
+local function file_exists(path)
+  local f = io.open(path, "r")
+  if f then
+    f:close()
+    return true
+  end
+  return false
+end
+
+local function detect_repo_root()
+  if type(debug) == "table" and type(debug.getinfo) == "function" then
+    local info = debug.getinfo(1, "S")
+    if info and type(info.source) == "string" and info.source:sub(1, 1) == "@" then
+      local tdir = info.source:sub(2):match("^(.*)[/\\][^/\\]+$") or "."
+      local root = tdir:match("^(.*)[/\\]tests$") or (tdir .. "/..")
+      if file_exists(root .. "/plugin/init.lua") then
+        return root
+      end
+    end
+  end
+  if type(wezterm.config_dir) == "string" and wezterm.config_dir ~= "" then
+    local cdir = wezterm.config_dir:gsub("[/\\]+$", "")
+    if file_exists(cdir .. "/plugin/init.lua") then
+      return cdir
+    end
+    local parent = cdir:match("^(.*)[/\\]tests$")
+    if parent and file_exists(parent .. "/plugin/init.lua") then
+      return parent
+    end
+  end
+  if file_exists("plugin/init.lua") then
+    return "."
+  end
+  if file_exists("../plugin/init.lua") then
+    return ".."
+  end
+  error("Unable to locate repo root containing plugin/init.lua")
+end
+
+local REPO_ROOT = detect_repo_root()
+
+local passed = 0
+local failed = 0
+local function test(name, fn)
+  local ok, err = xpcall(fn, function(e)
+    if type(debug) == "table" and type(debug.traceback) == "function" then
+      return debug.traceback(e, 2)
+    end
+    return tostring(e)
+  end)
+  if ok then
+    passed = passed + 1
+    io.stderr:write(string.format("[PASS] %s\n", name))
+  else
+    failed = failed + 1
+    io.stderr:write(string.format("[FAIL] %s: %s\n", name, tostring(err)))
+  end
+end
+
+local function assert_eq(actual, expected, msg)
+  if actual ~= expected then
+    error(
+      string.format(
+        "%s: expected %s (%s), got %s (%s)",
+        msg or "assert_eq failed",
+        tostring(expected),
+        type(expected),
+        tostring(actual),
+        type(actual)
+      ),
+      2
+    )
+  end
+end
+
+local function assert_true(cond, msg)
+  if not cond then
+    error(msg or "assert_true failed", 2)
+  end
+end
+
+local function make_temp_dir()
+  local dir = string.format("/tmp/agy-quota-wezterm-test-%d-%d", os.time(), math.random(100000, 999999))
+  assert_true(os.execute('mkdir -p "' .. dir .. '/panes"'), "failed to create temp dir")
+  return dir
+end
+
+local function remove_dir(dir)
+  os.execute('rm -rf "' .. dir .. '"')
+end
+
+local function write_file(path, content)
+  local f, err = io.open(path, "w")
+  assert_true(f ~= nil, "failed to write " .. path .. ": " .. tostring(err))
+  f:write(content)
+  f:close()
+end
+
+local function make_mock_pane(opts)
+  opts = opts or {}
+  local pane = {}
+  function pane:pane_id()
+    return opts.id or 0
+  end
+  function pane:get_dimensions()
+    return { cols = opts.cols or 105, rows = opts.rows or 25 }
+  end
+  function pane:get_current_working_dir()
+    if opts.cwd == nil then
+      return nil
+    end
+    return { file_path = opts.cwd }
+  end
+  function pane:get_foreground_process_info()
+    return opts.proc_info
+  end
+  function pane:get_foreground_process_name()
+    return opts.proc_name
+  end
+  return pane
+end
+
+local function make_mock_window(id, active_pane, tab_cols)
+  local win = { _last_right_status = nil }
+  function win:window_id()
+    return id or 1
+  end
+  function win:active_pane()
+    return active_pane
+  end
+  function win:active_tab()
+    if tab_cols == nil then
+      return nil
+    end
+    return {
+      get_size = function()
+        return { cols = tab_cols, rows = 25 }
+      end,
+    }
+  end
+  function win:set_right_status(s)
+    self._last_right_status = s
+  end
+  return win
+end
+
+-- Load plugin via dofile and verify require compatibility
+local plugin = dofile(REPO_ROOT .. "/plugin/init.lua")
+local render = plugin.render
+local state = plugin.state
+
+test("module loading via dofile and package.path require", function()
+  assert_eq(type(plugin.apply_to_config), "function", "apply_to_config")
+  assert_eq(type(plugin.setup), "function", "setup")
+  assert_eq(type(plugin.get_status_cells), "function", "get_status_cells")
+  assert_eq(type(plugin.get_status_text), "function", "get_status_text")
+  assert_eq(type(plugin.get_snapshot), "function", "get_snapshot")
+  assert_eq(type(plugin.trigger_refresh), "function", "trigger_refresh")
+  assert_eq(type(plugin.cycle_layout), "function", "cycle_layout")
+
+  local saved_path = package.path
+  package.path = REPO_ROOT .. "/?.lua;" .. saved_path
+  package.loaded["plugin.init"] = nil
+  local req_plugin = require("plugin.init")
+  assert_eq(type(req_plugin.get_status_cells), "function", "require(plugin.init)")
+
+  -- Also verify loading as `require("init")` via `<plugin_dir>/plugin/?.lua` (how wezterm.plugin.require loads plugins)
+  package.path = REPO_ROOT .. "/plugin/?.lua;" .. saved_path
+  package.loaded["init"] = nil
+  package.loaded["agy_quota.state"] = nil
+  package.loaded["agy_quota.render"] = nil
+  local init_plugin = require("init")
+  package.path = saved_path
+  assert_eq(type(init_plugin.apply_to_config), "function", "require(init) via plugin/?.lua")
+  assert_true(type(init_plugin.plugin_dir) == "string" and init_plugin.plugin_dir ~= "", "plugin_dir detected")
+end)
+
+test("3-stop continuous RGB gradient interpolation", function()
+  assert_eq(render.gradient_color(0), "#ff5555", "0% red")
+  assert_eq(render.gradient_color(50), "#ffd427", "50% yellow")
+  assert_eq(render.gradient_color(100), "#5cdb6d", "100% green")
+  assert_eq(render.gradient_color(-15), "#ff5555", "clamped <0")
+  assert_eq(render.gradient_color(120), "#5cdb6d", "clamped >100")
+  assert_eq(render.gradient_color(25), "#ff953e", "25% orange midpoint")
+  assert_eq(render.gradient_color(75), "#aed84a", "75% yellow-green midpoint")
+
+  -- Cached percentage mapping: clamp((pct - 80) / 20 * 100, 0, 100)
+  assert_eq(render.cached_color(100), "#5cdb6d", "cached 100%")
+  assert_eq(render.cached_color(90), "#ffd427", "cached 90%")
+  assert_eq(render.cached_color(80), "#ff5555", "cached 80%")
+  assert_eq(render.cached_color(45), "#ff5555", "cached <=80%")
+
+  -- Context color uses remaining % (100 - used_pct)
+  assert_eq(render.context_color(0), "#5cdb6d", "context 0% used -> green")
+  assert_eq(render.context_color(50), "#ffd427", "context 50% used -> yellow")
+  assert_eq(render.context_color(100), "#ff5555", "context 100% used -> red")
+
+  -- Quota color uses remaining %
+  assert_eq(render.quota_color(100), "#5cdb6d", "quota 100%")
+  assert_eq(render.quota_color(50), "#ffd427", "quota 50%")
+  assert_eq(render.quota_color(0), "#ff5555", "quota 0%")
+end)
+
+test("dynamic countdown formatting", function()
+  local now = 1730000000
+  assert_eq(render.format_countdown(now - 5, now), "now", "past epoch")
+  assert_eq(render.format_countdown(now, now), "now", "exact epoch")
+  assert_eq(render.format_countdown(now + 1, now), "<1m", "1s")
+  assert_eq(render.format_countdown(now + 59, now), "<1m", "59s")
+  assert_eq(render.format_countdown(now + 60, now), "1m", "60s")
+  assert_eq(render.format_countdown(now + 3599, now), "59m", "59m59s")
+  assert_eq(render.format_countdown(now + 4860, now), "1h21m", "1h21m")
+  assert_eq(render.format_countdown(now + 590400, now), "6d20h", "6d20h")
+  assert_eq(render.format_countdown(nil, now), nil, "nil epoch")
+end)
+
+test("token formatting in full and compact modes", function()
+  assert_eq(render.format_tokens(376200, "full"), "376.2k", "full k")
+  assert_eq(render.format_tokens(376200, "compact"), "376k", "compact k")
+  assert_eq(render.format_tokens(1000000, "full"), "1.0M", "full M")
+  assert_eq(render.format_tokens(1048576, "compact"), "1.0M", "compact M")
+  assert_eq(render.format_tokens(740, "full"), "740", "under 1k")
+end)
+
+test("responsive full / compact / minimal rendering and colors", function()
+  local now = 1730000000
+  local snap = {
+    now = now,
+    is_agy = true,
+    has_quota = true,
+    has_pane = true,
+    context = {
+      cached_pct = 99.1,
+      used_pct = 35.9,
+      used_tokens = 376200,
+      context_window_size = 1000000,
+    },
+    five_hour = {
+      remaining_pct = 49,
+      reset_epoch = now + 4860, -- 1h21m
+    },
+    weekly = {
+      remaining_pct = 86,
+      reset_epoch = now + 590400, -- 6d20h
+    },
+  }
+
+  local full_cells = render.render_cells(snap, 160, { layout = "auto" })
+  local full_text = render.cells_to_plain_text(full_cells)
+  assert_eq(
+    full_text,
+    "Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
+    "full layout text"
+  )
+
+  -- Verify countdown color #57caff and bar empty color #3b4052 exist in full cells
+  local found_countdown_color = false
+  local found_empty_bar_color = false
+  for i = 1, #full_cells do
+    local item = full_cells[i]
+    if item.Foreground and item.Foreground.Color == "#57caff" then
+      found_countdown_color = true
+    end
+    if item.Foreground and item.Foreground.Color == "#3b4052" then
+      found_empty_bar_color = true
+    end
+  end
+  assert_true(found_countdown_color, "countdown uses #57caff")
+  assert_true(found_empty_bar_color, "empty bar uses #3b4052")
+
+  local compact_cells = render.render_cells(snap, 105, { layout = "auto" })
+  assert_eq(
+    render.cells_to_plain_text(compact_cells),
+    "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
+    "compact layout text at 105 cols"
+  )
+
+  local minimal_cells = render.render_cells(snap, 80, { layout = "auto" })
+  assert_eq(
+    render.cells_to_plain_text(minimal_cells),
+    "C 99% │ Ctx 36% │ 5h 49% 1h21m │ Wk 86% 6d20h",
+    "minimal layout text at 80 cols"
+  )
+
+  -- Context hiding outside agy
+  snap.is_agy = false
+  local outside_default = render.render_cells(snap, 105, { hide_context_outside_agy = true })
+  assert_eq(
+    render.cells_to_plain_text(outside_default),
+    "5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
+    "context hidden outside agy"
+  )
+
+  local outside_shown = render.render_cells(snap, 105, { show_context_outside_agy = true })
+  assert_eq(
+    render.cells_to_plain_text(outside_shown),
+    "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
+    "context shown outside agy when configured"
+  )
+end)
+
+test("pool selection priority and timestamp parsing", function()
+  local quota = {
+    default_pool = "gemini",
+    pools = {
+      gemini = { label = "Gemini", five_hour = { remaining_pct = 49 } },
+      claude = { label = "Claude", five_hour = { remaining_pct = 75 } },
+    },
+    model_pools = {
+      ["claude-sonnet-4-5"] = "claude",
+    },
+  }
+
+  local k1 = state.resolve_pool(quota, { pool = "claude", model_id = "gemini-3-pro" }, {})
+  assert_eq(k1, "claude", "pane.pool takes precedence over model_id")
+
+  local k2 = state.resolve_pool(quota, { model_id = "claude-sonnet-4-5" }, {})
+  assert_eq(k2, "claude", "model_pools lookup")
+
+  local k3 = state.resolve_pool(quota, {}, {})
+  assert_eq(k3, "gemini", "default_pool fallback")
+
+  local k4 = state.resolve_pool(quota, { pool = "claude" }, { pool = "gemini" })
+  assert_eq(k4, "gemini", "opts.pool override")
+
+  assert_eq(state.parse_epoch(1730000000), 1730000000, "epoch seconds")
+  assert_eq(state.parse_epoch(1730000000000), 1730000000, "epoch milliseconds")
+  local iso_z = state.parse_epoch("2026-11-27T08:00:00Z")
+  local iso_plus8 = state.parse_epoch("2026-11-27T16:00:00+08:00")
+  assert_true(type(iso_z) == "number", "ISO-8601 Z parsed")
+  assert_eq(iso_z, iso_plus8, "ISO-8601 timezone offset equivalence")
+end)
+
+test("cache dir env resolution and pane process detection", function()
+  local env1 = state.resolve_cache_dir({
+    env_fn = function(k)
+      if k == "WEZTERM_AGY_STATUS_DIR" then
+        return "/custom/agy-dir/"
+      end
+      return nil
+    end,
+  })
+  assert_eq(env1, "/custom/agy-dir", "WEZTERM_AGY_STATUS_DIR precedence")
+
+  local env2 = state.resolve_cache_dir({
+    env_fn = function(k)
+      if k == "XDG_CACHE_HOME" then
+        return "/tmp/xdg-cache/"
+      end
+      return nil
+    end,
+  })
+  assert_eq(env2, "/tmp/xdg-cache/wezterm-agy-status", "XDG_CACHE_HOME fallback")
+
+  state.reset()
+  local agy_direct = make_mock_pane({
+    id = 10,
+    proc_info = { executable = "/home/xiaolu/.local/bin/agy", name = "agy", children = {} },
+  })
+  assert_true(state.detect_is_agy(agy_direct, {}, 1000), "direct agy binary")
+
+  local agy_child = make_mock_pane({
+    id = 11,
+    proc_info = {
+      executable = "/bin/bash",
+      name = "bash",
+      children = {
+        [999] = { executable = "/usr/bin/node", name = "node", argv = { "node", "/opt/bin/agy" }, children = {} },
+      },
+    },
+  })
+  assert_true(state.detect_is_agy(agy_child, {}, 1000), "nested agy child process")
+
+  local collector_proc = make_mock_pane({
+    id = 12,
+    proc_info = {
+      executable = "/usr/bin/node",
+      name = "node",
+      argv = { "node", "/home/xiaolu/agy-quota.wezterm/bin/agy-status-collector.mjs", "--refresh" },
+      children = {},
+    },
+  })
+  assert_eq(state.detect_is_agy(collector_proc, {}, 1000), false, "collector does not false-positive")
+
+  -- Process cache TTL 2s verification
+  local dynamic_pane = make_mock_pane({
+    id = 13,
+    proc_info = { executable = "/bin/bash", name = "bash", children = {} },
+  })
+  assert_eq(state.detect_is_agy(dynamic_pane, {}, 1000), false, "initially bash")
+  local agy_switched = make_mock_pane({
+    id = 13,
+    proc_info = { executable = "/home/xiaolu/.local/bin/agy", name = "agy", children = {} },
+  })
+  assert_eq(state.detect_is_agy(agy_switched, {}, 1001), false, "cached within 2s TTL")
+  assert_eq(state.detect_is_agy(agy_switched, {}, 1002.1), true, "refreshed after 2s TTL")
+end)
+
+test("JSON cache reading, memory throttling, malformed JSON safety, and stale refresh gating", function()
+  local tmp_dir = make_temp_dir()
+  local ok, err = pcall(function()
+    state.reset()
+    local spawns = {}
+    local opts = {
+      cache_dir = tmp_dir,
+      node_bin = "/usr/local/bin/node",
+      collector_script = "/opt/agy/bin/agy-status-collector.mjs",
+      spawn_fn = function(argv)
+        table.insert(spawns, argv)
+      end,
+    }
+
+    local pane = make_mock_pane({
+      id = 42,
+      cols = 105,
+      cwd = "/home/xiaolu/project",
+      proc_info = { executable = "/home/xiaolu/.local/bin/agy", name = "agy", children = {} },
+    })
+
+    -- 1. Missing quota.json & pane_42.json -> triggers spawn once, cooldown blocks rapid second spawn
+    local s1 = state.get_snapshot(pane, opts, 1000)
+    assert_eq(s1.has_quota, false, "missing quota.json")
+    assert_eq(#spawns, 1, "spawned when cache missing")
+    assert_eq(spawns[1][1], "/usr/local/bin/node", "argv node_bin")
+    assert_eq(spawns[1][2], "/opt/agy/bin/agy-status-collector.mjs", "argv collector")
+    assert_eq(spawns[1][3], "--refresh", "argv --refresh")
+    assert_eq(spawns[1][4], "--pane", "argv --pane")
+    assert_eq(spawns[1][5], "42", "argv pane id")
+    assert_eq(spawns[1][6], "--cwd", "argv --cwd")
+    assert_eq(spawns[1][7], "/home/xiaolu/project", "argv cwd")
+
+    state.get_snapshot(pane, opts, 1002)
+    assert_eq(#spawns, 1, "spawn cooldown (>=4s) prevents rapid respawn")
+
+    -- 2. Malformed JSON never throws
+    write_file(tmp_dir .. "/quota.json", "{broken json")
+    local s_bad = state.get_snapshot(pane, opts, 1005)
+    assert_eq(s_bad.has_quota, false, "malformed json returns nil cleanly")
+    assert_eq(#spawns, 2, "spawned again after cooldown")
+
+    -- 3. Valid quota.json & pane_42.json with JSON nulls
+    write_file(
+      tmp_dir .. "/quota.json",
+      [[{
+        "version": 1,
+        "fetched_at": 1006,
+        "source": "cloudcode",
+        "plan_tier": "pro",
+        "default_pool": "gemini",
+        "pools": {
+          "gemini": {
+            "label": "Gemini",
+            "five_hour": { "remaining_pct": 49, "reset_time": null, "reset_epoch": 5866 },
+            "weekly": { "remaining_pct": 86, "reset_time": null, "reset_epoch": 591406 }
+          }
+        },
+        "model_pools": { "gemini-3-pro": "gemini" }
+      }]]
+    )
+    write_file(
+      tmp_dir .. "/panes/pane_42.json",
+      [[{
+        "version": 1,
+        "pane_id": 42,
+        "model_id": "gemini-3-pro",
+        "pool": "gemini",
+        "context": {
+          "used_tokens": 376200,
+          "context_window_size": 1000000,
+          "used_pct": 35.9,
+          "remaining_pct": 64.1,
+          "cached_pct": 99.1
+        },
+        "updated_at": 1006
+      }]]
+    )
+
+    -- Within 1s read throttle from 1005 -> still cached bad nil until 1006.1
+    local s_throttled = state.get_snapshot(pane, opts, 1005.5)
+    assert_eq(s_throttled.has_quota, false, "1s cache read throttle holds previous read")
+
+    -- Verify dynamic countdown ticks between polls without rewriting quota.json!
+    local cells_t0 = render.render_cells(
+      state.get_snapshot(pane, opts, 1006),
+      105,
+      {}
+    )
+    assert_eq(
+      render.cells_to_plain_text(cells_t0),
+      "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
+      "countdown at now=1006"
+    )
+
+    -- One second later (1007), countdowns tick down cleanly without re-polling!
+    local s_fresh = state.get_snapshot(pane, opts, 1007)
+    assert_eq(s_fresh.has_quota, true, "reads fresh quota.json after 1s")
+    assert_eq(s_fresh.has_pane, true, "reads fresh pane_42.json after 1s")
+    assert_eq(#spawns, 2, "fresh cache does not spawn")
+
+    local cells_t1 = render.render_cells(s_fresh, 105, {})
+    assert_eq(
+      render.cells_to_plain_text(cells_t1),
+      "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h20m │ Wk 86% █████░ 6d19h",
+      "countdown ticks dynamically at now=1007"
+    )
+
+    -- At 1011 (1006 + 5s = active_poll_interval_secs), active agy pane triggers spawn!
+    local s_pane_stale = state.get_snapshot(pane, opts, 1011)
+    assert_eq(s_pane_stale.pane_stale, true, "active pane stale after 5s")
+    assert_eq(#spawns, 3, "active agy pane triggers refresh at 5s")
+
+    -- Manual trigger_refresh forces spawn & clears read cache
+    local triggered = state.trigger_refresh(pane, opts, 1011)
+    assert_true(triggered, "trigger_refresh succeeds")
+    assert_eq(#spawns, 4, "trigger_refresh spawned")
+
+    -- Non-agy bash pane: fresh quota (<30s) does NOT spawn even when pane_<id>.json missing;
+    -- stale quota (>=30s) DOES spawn.
+    local bash_pane = make_mock_pane({
+      id = 77,
+      cols = 105,
+      cwd = "/home/xiaolu",
+      proc_info = { executable = "/bin/bash", name = "bash", children = {} },
+    })
+    local count_before_bash = #spawns
+    local sb1 = state.get_snapshot(bash_pane, opts, 1020) -- 1020 - 1006 = 14s < 30s
+    assert_eq(sb1.is_agy, false, "bash pane is not agy")
+    assert_eq(sb1.quota_stale, false, "quota fresh at 14s")
+    assert_eq(sb1.pane_stale, false, "non-agy pane does not require pane json")
+    assert_eq(#spawns, count_before_bash, "no spawn for fresh quota in bash pane")
+
+    local sb2 = state.get_snapshot(bash_pane, opts, 1036) -- 1036 - 1006 = 30s >= 30s
+    assert_eq(sb2.quota_stale, true, "quota stale at 30s")
+    assert_eq(#spawns, count_before_bash + 1, "stale quota triggers refresh even in bash pane")
+
+    -- Derived used_pct when pane json omits used_pct
+    write_file(
+      tmp_dir .. "/panes/pane_88.json",
+      [[{
+        "version": 1,
+        "pane_id": 88,
+        "context": {
+          "used_tokens": 250000,
+          "context_window_size": 1000000
+        },
+        "updated_at": 1036
+      }]]
+    )
+    local derived_pane = make_mock_pane({
+      id = 88,
+      cols = 105,
+      proc_info = { executable = "/home/xiaolu/.local/bin/agy", name = "agy", children = {} },
+    })
+    local sd = state.get_snapshot(derived_pane, opts, 1037)
+    assert_eq(sd.context.used_pct, 25, "derived used_pct from tokens/window")
+    assert_eq(sd.context.remaining_pct, 75, "derived remaining_pct")
+  end)
+  remove_dir(tmp_dir)
+  if not ok then
+    error(err)
+  end
+end)
+
+test("node_bin and collector_script auto-resolution and empty/placeholder rendering", function()
+  state.reset()
+  local node = state.resolve_node_bin({})
+  assert_true(type(node) == "string" and node ~= "", "node_bin resolved")
+
+  local collector = state.resolve_collector_script({ plugin_dir = REPO_ROOT .. "/plugin" })
+  assert_true(type(collector) == "string" and collector:find("agy%-status%-collector%.mjs$") ~= nil, "collector_script auto-resolved")
+
+  local empty_cells = render.render_cells({ is_agy = false, has_quota = false }, 105, {})
+  assert_eq(render.cells_to_plain_text(empty_cells), "5h -- │ Wk --", "placeholder when empty")
+
+  local hidden_cells = render.render_cells({ is_agy = false, has_quota = false }, 105, { hide_when_empty = true })
+  assert_eq(#hidden_cells, 0, "hide_when_empty returns empty cell list")
+end)
+
+test("composable API, layout cycling, and apply_to_config integration", function()
+  local tmp_dir = make_temp_dir()
+  local ok, err = pcall(function()
+    state.reset()
+    write_file(
+      tmp_dir .. "/quota.json",
+      [[{
+        "version": 1,
+        "fetched_at": 2000,
+        "default_pool": "gemini",
+        "pools": {
+          "gemini": {
+            "label": "Gemini",
+            "five_hour": { "remaining_pct": 49, "reset_epoch": 6860 },
+            "weekly": { "remaining_pct": 86, "reset_epoch": 592400 }
+          }
+        }
+      }]]
+    )
+    write_file(
+      tmp_dir .. "/panes/pane_7.json",
+      [[{
+        "version": 1,
+        "pane_id": 7,
+        "pool": "gemini",
+        "context": {
+          "used_tokens": 376200,
+          "context_window_size": 1000000,
+          "used_pct": 35.9,
+          "cached_pct": 99.1
+        },
+        "updated_at": 2000
+      }]]
+    )
+
+    local pane = make_mock_pane({
+      id = 7,
+      cols = 105,
+      cwd = "/home/xiaolu/work",
+      proc_info = { executable = "/home/xiaolu/.local/bin/agy", name = "agy", children = {} },
+    })
+    local win = make_mock_window(99, pane)
+
+    plugin.setup({
+      cache_dir = tmp_dir,
+      spawn_fn = function() end,
+    })
+
+    local cells = plugin.get_status_cells(win, pane, nil, 2000)
+    assert_eq(
+      render.cells_to_plain_text(cells),
+      "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
+      "get_status_cells output"
+    )
+
+    local formatted = plugin.get_status_text(win, pane, nil, 2000)
+    assert_true(formatted:find("\x1b%[38:2:") ~= nil, "get_status_text emits ANSI truecolor")
+
+    -- Composing with user cwd + time cells
+    table.insert(cells, { Foreground = { Color = "#a9b0c2" } })
+    table.insert(cells, { Text = "  ~/work  " })
+    table.insert(cells, { Foreground = { Color = "#e6dcc3" } })
+    table.insert(cells, { Text = "16:37 " })
+    local combined = wezterm.format(cells)
+    assert_true(#combined > #formatted, "composable cells integrate cleanly with wezterm.format")
+
+    local narrow_split_pane = make_mock_pane({
+      id = 7,
+      cols = 52,
+      cwd = "/home/xiaolu/work",
+      proc_info = { executable = "/home/xiaolu/.local/bin/agy", name = "agy", children = {} },
+    })
+    local wide_win = make_mock_window(100, narrow_split_pane, 150)
+    assert_eq(
+      render.cells_to_plain_text(plugin.get_status_cells(wide_win, narrow_split_pane, nil, 2000)),
+      "Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
+      "tab:get_size().cols determines full-bar layout even on narrow split pane"
+    )
+
+    -- Layout cycling
+    assert_eq(plugin.get_layout(win), "auto", "initial layout auto")
+    assert_eq(plugin.cycle_layout(win), "full", "cycle -> full")
+    assert_eq(
+      render.cells_to_plain_text(plugin.get_status_cells(win, pane, nil, 2000)),
+      "Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
+      "overridden full layout on 105-col pane"
+    )
+    assert_eq(plugin.cycle_layout(win), "compact", "cycle -> compact")
+    assert_eq(plugin.cycle_layout(win), "minimal", "cycle -> minimal")
+    assert_eq(plugin.cycle_layout(win), "auto", "cycle -> auto")
+
+    -- apply_to_config on a real wezterm.config_builder() preserving existing keys
+    local real_now = os.time()
+    write_file(
+      tmp_dir .. "/quota.json",
+      string.format(
+        '{"version":1,"fetched_at":%d,"default_pool":"gemini","pools":{"gemini":{"five_hour":{"remaining_pct":49,"reset_epoch":%d},"weekly":{"remaining_pct":86,"reset_epoch":%d}}}}',
+        real_now,
+        real_now + 4860,
+        real_now + 590400
+      )
+    )
+    write_file(
+      tmp_dir .. "/panes/pane_7.json",
+      string.format(
+        '{"version":1,"pane_id":7,"pool":"gemini","context":{"used_tokens":376200,"context_window_size":1000000,"used_pct":35.9,"cached_pct":99.1},"updated_at":%d}',
+        real_now
+      )
+    )
+    state.reset()
+
+    local cfg = wezterm.config_builder()
+    cfg.keys = {
+      { key = "b", mods = "CTRL|SHIFT", action = wezterm.action.ReloadConfiguration },
+    }
+    plugin.apply_to_config(cfg, {
+      cache_dir = tmp_dir,
+      toggle_layout_key = "q",
+      refresh_key = { key = "r", mods = "CTRL|SHIFT" },
+      append_cwd = true,
+      append_time = true,
+      spawn_fn = function() end,
+    })
+    assert_eq(#cfg.keys, 3, "existing keys preserved plus 2 optional keybinds")
+    assert_eq(cfg.keys[1].key, "b", "existing key preserved")
+    assert_eq(cfg.keys[2].key, "q", "toggle_layout_key bound")
+    assert_eq(cfg.keys[2].mods, "CTRL|SHIFT", "default key_mods applied")
+    assert_eq(cfg.keys[3].key, "r", "refresh_key bound")
+
+    -- Trigger registered update-status event and verify window:set_right_status output
+    wezterm.emit("update-status", win, pane)
+    assert_true(type(win._last_right_status) == "string" and #win._last_right_status > 0, "update-status sets right status")
+    assert_true(win._last_right_status:find("99%.1%%") ~= nil, "right status includes cached pct")
+    assert_true(win._last_right_status:find("~/work") ~= nil, "right status includes appended cwd")
+  end)
+  remove_dir(tmp_dir)
+  if not ok then
+    error(err)
+  end
+end)
+
+if failed > 0 then
+  io.stderr:write(string.format("\n%d test(s) failed, %d passed.\n", failed, passed))
+  os.exit(1)
+end
+
+io.stderr:write(string.format("\nAll %d WezTerm Lua tests passed!\n", passed))
+return {}
