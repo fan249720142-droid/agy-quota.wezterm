@@ -1,13 +1,15 @@
 import {
   getStatusDir,
   loadEndpoints,
+  loadModelLimitsCache,
   loadPane,
   loadQuota,
   sanitizePaneId,
   saveEndpoints,
   savePane,
 } from './cache.mjs';
-import { classifyPoolByKeywords, normalizeModelKey } from './models.mjs';
+import { buildModelIndex } from './models.mjs';
+import { computeModelTracking, resolveActiveModelState } from './model-tracking.mjs';
 
 export function readStdinAsync(timeoutMs = 200) {
   return new Promise((resolve) => {
@@ -61,6 +63,19 @@ export function deriveAgentState(hookEvent, payload, previousState) {
   }
 }
 
+function extractHookModel(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const nested = payload.model && typeof payload.model === 'object'
+    ? (payload.model.name || payload.model.displayName || payload.model.id)
+    : payload.model;
+  for (const cand of [payload.modelName, payload.model_name, nested, payload.modelId, payload.model_id]) {
+    if (typeof cand === 'string' && cand.trim()) {
+      return cand.trim();
+    }
+  }
+  return null;
+}
+
 /**
  * Apply an Antigravity hook payload to `ls_endpoints.json` (0600) and `panes/pane_<id>.json`.
  */
@@ -69,13 +84,18 @@ export function applyHookUpdate({
   payload = {},
   env = process.env,
   statusDir = getStatusDir(),
-  nowEpoch = Math.floor(Date.now() / 1000),
-}) {
+  nowMs = Date.now(),
+  nowEpoch = Math.floor(nowMs / 1000),
+} = {}) {
+  const effectiveNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const effectiveNowEpoch = Number.isFinite(nowEpoch) ? nowEpoch : Math.floor(effectiveNowMs / 1000);
   const paneId = sanitizePaneId(env.WEZTERM_PANE);
   const existingPane = loadPane(statusDir, paneId);
   const endpointsStore = loadEndpoints(statusDir);
   const existingEp = endpointsStore.endpoints[paneId];
   const existingQuota = loadQuota(statusDir);
+  const cachedLimits = loadModelLimitsCache(statusDir);
+  const modelIndex = buildModelIndex(null, [], cachedLimits);
 
   const conversationId = payload.conversationId
     || payload.conversation_id
@@ -103,42 +123,32 @@ export function applyHookUpdate({
       prefer_https: preferHttps,
       conversation_id: conversationId,
       pid: process.ppid || process.pid,
-      updated_at: nowEpoch,
+      updated_at: effectiveNowEpoch,
     };
     endpointsStore.latest_key = paneId;
     saveEndpoints(statusDir, endpointsStore);
   }
 
-  const sameConversation = conversationId && existingPane?.conversation_id === conversationId;
-  const rawModelName = payload.modelName || payload.model || payload.modelId || null;
+  const sameConversation = Boolean(!conversationId || !existingPane?.conversation_id || existingPane.conversation_id === conversationId);
+  const rawModelName = extractHookModel(payload);
 
-  let modelId = sameConversation ? (existingPane?.model_id || null) : null;
-  let modelDisplayName = sameConversation ? (existingPane?.model_display_name || null) : null;
-  if (rawModelName) {
-    if (/^MODEL_/i.test(String(rawModelName))) {
-      modelId = String(rawModelName);
-    } else {
-      modelDisplayName = String(rawModelName);
-    }
-  }
+  const modelTracking = computeModelTracking({
+    prevPane: existingPane,
+    conversationId,
+    settingsInfo: undefined,
+    hookInput: rawModelName ? { model: rawModelName, at: effectiveNowMs } : null,
+    stepInput: null,
+    nowMs: effectiveNowMs,
+  });
 
-  let pool = sameConversation ? (existingPane?.pool || null) : null;
-  if (rawModelName || modelDisplayName || modelId) {
-    const modelPools = existingQuota?.model_pools || {};
-    for (const candidate of [modelDisplayName, modelId, rawModelName]) {
-      const nk = normalizeModelKey(candidate);
-      if (nk && modelPools[nk]) {
-        pool = modelPools[nk];
-        break;
-      }
-    }
-    if (!pool) {
-      pool = classifyPoolByKeywords(modelDisplayName || rawModelName || modelId);
-    }
-  }
-  if (!pool) {
-    pool = existingQuota?.default_pool || 'gemini';
-  }
+  const activeModel = resolveActiveModelState({
+    modelTracking,
+    prevPane: existingPane,
+    sameConversation,
+    modelIndex,
+    modelPools: existingQuota?.model_pools || {},
+    defaultPool: existingQuota?.default_pool || 'gemini',
+  });
 
   const agentState = deriveAgentState(hookEvent, payload, existingPane?.agent_state);
 
@@ -147,12 +157,14 @@ export function applyHookUpdate({
     pane_id: paneId,
     conversation_id: conversationId,
     cwd,
-    model_id: modelId,
-    model_display_name: modelDisplayName,
-    pool,
+    model_id: activeModel.model_id,
+    model_display_name: activeModel.model_display_name,
+    pool: activeModel.pool,
+    pool_label: activeModel.pool_label,
+    model_tracking: modelTracking,
     agent_state: agentState,
     context: sameConversation ? (existingPane?.context ?? null) : null,
-    updated_at: nowEpoch,
+    updated_at: effectiveNowEpoch,
   };
 
   savePane(statusDir, paneId, panePayload);

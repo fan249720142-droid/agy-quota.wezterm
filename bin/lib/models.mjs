@@ -1,7 +1,11 @@
-const POOL_LABELS = {
+export const POOL_LABELS = {
   gemini: 'Gemini',
-  '3p': 'Claude & GPT',
+  '3p': 'Claude/GPT',
 };
+
+export function getPoolLabel(pool) {
+  return POOL_LABELS[pool] || (pool === '3p' ? 'Claude/GPT' : 'Gemini');
+}
 
 export function round2(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
@@ -27,8 +31,12 @@ export function enumIntToModelId(enumInt) {
 export function classifyPoolByKeywords(name) {
   const s = String(name ?? '');
   if (!s) return null;
-  if (/(claude|opus|sonnet|haiku|gpt|openai|\b3p\b)/i.test(s)) return '3p';
-  if (/(gemini|orchestrator)/i.test(s)) return 'gemini';
+  if (/(claude|opus|sonnet|haiku|gpt[\s_-]*oss|chatgpt|gpt|openai|anthropic|(?:^|[^a-z0-9])3p(?:[^a-z0-9]|$))/i.test(s)) {
+    return '3p';
+  }
+  if (/(gemini|orchestrator|hydrogen|neon|argon|carbon|flash)/i.test(s)) {
+    return 'gemini';
+  }
   return null;
 }
 
@@ -38,9 +46,10 @@ function emptyWindow() {
 
 function formatBucket(bucket) {
   if (!bucket || typeof bucket !== 'object') return emptyWindow();
-  const frac = typeof bucket.remainingFraction === 'number'
-    ? bucket.remainingFraction
-    : Number(bucket.remainingFraction);
+  const rawFrac = bucket.remainingFraction;
+  const frac = typeof rawFrac === 'number'
+    ? rawFrac
+    : (typeof rawFrac === 'string' && rawFrac.trim() !== '' ? Number(rawFrac) : NaN);
   const remaining_pct = Number.isFinite(frac) ? round2(frac * 100) : null;
   const reset_time = typeof bucket.resetTime === 'string' && bucket.resetTime ? bucket.resetTime : null;
   const reset_epoch = parseResetEpoch(reset_time);
@@ -153,9 +162,13 @@ export function buildQuotaPayload({
       const id = String(b?.bucketId || '');
       if (id.startsWith('gemini')) { poolKey = 'gemini'; break; }
       if (id.startsWith('3p')) { poolKey = '3p'; break; }
+      const byBucket = classifyPoolByKeywords(id);
+      if (byBucket) { poolKey = byBucket; break; }
     }
     if (!poolKey) {
-      poolKey = classifyPoolByKeywords(group.displayName) || 'gemini';
+      poolKey = classifyPoolByKeywords(group.displayName)
+        || classifyPoolByKeywords(group.description)
+        || 'gemini';
     }
 
     const poolObj = pools[poolKey] || {
@@ -236,8 +249,27 @@ export function buildQuotaPayload({
   };
 }
 
+function lookupByKeyOrPrefix(map, keys, accept = (v) => Boolean(v)) {
+  if (!map || typeof map !== 'object') return null;
+  for (const k of keys) {
+    if (accept(map[k])) return map[k];
+  }
+  let bestLen = 0;
+  let bestVal = null;
+  for (const k of keys) {
+    for (const [mk, mv] of Object.entries(map)) {
+      if (!accept(mv)) continue;
+      if ((mk.startsWith(k) || k.startsWith(mk)) && Math.min(mk.length, k.length) > bestLen) {
+        bestLen = Math.min(mk.length, k.length);
+        bestVal = mv;
+      }
+    }
+  }
+  return bestVal;
+}
+
 /**
- * Resolve model_id, model_display_name, pool, and context_window_size from
+ * Resolve model_id, model_display_name, pool, pool_label, and context_window_size from
  * combined RPC / SQLite / cached indices.
  */
 export function resolveModelMetadata({
@@ -248,6 +280,7 @@ export function resolveModelMetadata({
   chatStartMetadata = null,
   modelIndex = { limitsByKey: {}, displayByKey: {}, modelIdByKey: {} },
   modelPools = {},
+  defaultPool = 'gemini',
 }) {
   const enumPlaceholder = enumIntToModelId(modelEnumInt);
   const candidates = [modelDisplayName, modelId, enumPlaceholder, responseModel]
@@ -256,12 +289,7 @@ export function resolveModelMetadata({
 
   let resolvedModelId = modelId || null;
   if (!resolvedModelId) {
-    for (const k of candidates) {
-      if (modelIndex.modelIdByKey?.[k]) {
-        resolvedModelId = modelIndex.modelIdByKey[k];
-        break;
-      }
-    }
+    resolvedModelId = lookupByKeyOrPrefix(modelIndex.modelIdByKey, candidates);
   }
   if (!resolvedModelId && enumPlaceholder) {
     resolvedModelId = enumPlaceholder;
@@ -269,12 +297,8 @@ export function resolveModelMetadata({
 
   let resolvedDisplay = modelDisplayName || null;
   if (!resolvedDisplay) {
-    for (const k of [resolvedModelId, ...candidates].map(normalizeModelKey).filter(Boolean)) {
-      if (modelIndex.displayByKey?.[k]) {
-        resolvedDisplay = modelIndex.displayByKey[k];
-        break;
-      }
-    }
+    const displayKeys = [resolvedModelId, ...candidates].map(normalizeModelKey).filter(Boolean);
+    resolvedDisplay = lookupByKeyOrPrefix(modelIndex.displayByKey, displayKeys);
   }
 
   const allKeys = [resolvedDisplay, resolvedModelId, responseModel, modelDisplayName, modelId]
@@ -304,36 +328,20 @@ export function resolveModelMetadata({
     pool = classifyPoolByKeywords(resolvedDisplay)
       || classifyPoolByKeywords(responseModel)
       || classifyPoolByKeywords(resolvedModelId)
+      || defaultPool
       || 'gemini';
   }
 
   // 2. Resolve context_window_size: GetAvailableModels exact -> prefix -> chatStartMetadata -> family fallback.
-  let contextWindowSize = null;
   const limits = modelIndex.limitsByKey || {};
-  for (const k of allKeys) {
-    if (limits[k] > 0) {
-      contextWindowSize = limits[k];
-      break;
-    }
-  }
-  if (!contextWindowSize) {
-    let bestLen = 0;
-    for (const k of allKeys) {
-      for (const [lk, lv] of Object.entries(limits)) {
-        if ((lk.startsWith(k) || k.startsWith(lk)) && Math.min(lk.length, k.length) > bestLen && lv > 0) {
-          bestLen = Math.min(lk.length, k.length);
-          contextWindowSize = lv;
-        }
-      }
-    }
-  }
+  let contextWindowSize = lookupByKeyOrPrefix(limits, allKeys, (v) => typeof v === 'number' && v > 0);
   if (!contextWindowSize) {
     const combined = `${resolvedDisplay || ''} ${responseModel || ''} ${resolvedModelId || ''}`;
     if (/(claude|opus|sonnet)[\s_-]*5[\s._-]*5/i.test(combined)) {
       contextWindowSize = 1000000;
     } else if (/gpt[\s_-]*oss[\s_-]*120b/i.test(combined)) {
       contextWindowSize = 131072;
-    } else if (/gemini[\s_-]*(4|3\.8|3\.5|3\.1|3|2\.5)|orchestrator/i.test(combined)) {
+    } else if (/gemini[\s_-]*(4|3\.8|3\.5|3\.1|3|2\.5)|orchestrator|hydrogen|neon|argon|carbon/i.test(combined)) {
       contextWindowSize = 1048576;
     }
   }
@@ -356,6 +364,7 @@ export function resolveModelMetadata({
     model_id: resolvedModelId,
     model_display_name: resolvedDisplay,
     pool,
+    pool_label: getPoolLabel(pool),
     context_window_size: contextWindowSize,
   };
 }

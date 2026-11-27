@@ -483,12 +483,17 @@ export async function readConversationFromSqlite({
 
       let latestMeta = null;
       let latestUsageMeta = null;
+      let stepCount = 0;
 
       const hasGen = db.prepare(
         "SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='gen_metadata'"
       ).get();
 
       if (hasGen) {
+        const cntRow = db.prepare('SELECT COUNT(*) AS cnt FROM gen_metadata').get();
+        if (Number(cntRow?.cnt) > 0) {
+          stepCount = Number(cntRow.cnt);
+        }
         const rows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx DESC LIMIT 32').all();
         for (const r of rows) {
           if (!r?.data) continue;
@@ -509,6 +514,10 @@ export async function readConversationFromSqlite({
           "SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='steps'"
         ).get();
         if (hasSteps) {
+          if (stepCount === 0) {
+            const cntRow = db.prepare('SELECT COUNT(*) AS cnt FROM steps WHERE metadata IS NOT NULL').get();
+            stepCount = Number(cntRow?.cnt) || 0;
+          }
           const rows = db.prepare(
             'SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx DESC LIMIT 32'
           ).all();
@@ -531,6 +540,7 @@ export async function readConversationFromSqlite({
       return {
         conversation_id: cid,
         cwd: wsPaths[0] || cwd || null,
+        stepCount,
         modelEnumInt: combinedMeta?.modelEnumInt || latestMeta?.modelEnumInt || null,
         modelDisplayName: latestMeta?.modelDisplayName || combinedMeta?.modelDisplayName || null,
         responseModel: latestMeta?.responseModel || combinedMeta?.responseModel || null,

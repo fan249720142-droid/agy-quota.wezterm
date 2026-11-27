@@ -16,6 +16,8 @@ import {
   releaseLock,
 } from '../bin/lib/cache.mjs';
 import { callLsRpc } from '../bin/lib/ls-rpc.mjs';
+import { applyHookUpdate } from '../bin/lib/hook-handler.mjs';
+import { buildQuotaPayload, classifyPoolByKeywords } from '../bin/lib/models.mjs';
 import { decodeGeneratorMetadataProto, loadSqlite, readConversationFromSqlite } from '../bin/lib/sqlite-fallback.mjs';
 import { runDump, runRefresh } from '../bin/agy-status-collector.mjs';
 
@@ -311,7 +313,7 @@ test('LS RPC collector parses quota, model_pools, pagination, used_pct & cached_
   assert.equal(quota.pools.gemini.five_hour.remaining_pct, 80.66);
   assert.equal(quota.pools.gemini.five_hour.reset_epoch, Math.floor(Date.parse('2026-11-27T12:46:30Z') / 1000));
   assert.equal(quota.pools.gemini.weekly.remaining_pct, 91.94);
-  assert.equal(quota.pools['3p'].label, 'Claude & GPT');
+  assert.equal(quota.pools['3p'].label, 'Claude/GPT');
   assert.equal(quota.pools['3p'].five_hour.remaining_pct, 100);
   assert.equal(quota.pools['3p'].five_hour.reset_time, null);
   assert.equal(quota.model_pools.gemini4hydrogenxhigh, 'gemini');
@@ -818,5 +820,461 @@ test('Collector --hook mode and hook-bridge detached collector integration work 
   assert.ok(pane14, 'detached collector should populate quota.json and pane context');
   assert.equal(pane14.agent_state, 'idle');
   assert.equal(pane14.context.used_pct, 26.64);
+});
+
+test('Pool classification completeness and buildQuotaPayload preserve 3p/gemini labels and buckets without resetTime', () => {
+  const threePExamples = [
+    'Claude Opus 5.5 (High)',
+    'Sonnet 4.5',
+    'Haiku 4',
+    'GPT-5',
+    'GPT-OSS 120B (Medium)',
+    'ChatGPT Plus',
+    'OpenAI o3',
+    'Anthropic Claude',
+    '3p',
+    'pool-3p-5h',
+  ];
+  for (const name of threePExamples) {
+    assert.equal(classifyPoolByKeywords(name), '3p', `expected 3p for "${name}"`);
+  }
+
+  const geminiExamples = [
+    'Gemini 4 Hydrogen (XHigh)',
+    'Orchestrator',
+    'Hydrogen',
+    'Neon',
+    'Argon',
+    'Carbon',
+    'Flash',
+  ];
+  for (const name of geminiExamples) {
+    assert.equal(classifyPoolByKeywords(name), 'gemini', `expected gemini for "${name}"`);
+  }
+
+  const quota = buildQuotaPayload({
+    quotaSummaryResp: {
+      response: {
+        groups: [
+          {
+            displayName: 'Gemini',
+            description: 'Models within this group: Hydrogen, Neon, Argon, Carbon, Flash',
+            buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 1 }],
+          },
+          {
+            displayName: 'Anthropic / OpenAI',
+            description: 'Models within this group: Claude, Opus, Sonnet, Haiku, GPT-OSS, ChatGPT',
+            buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 1 }],
+          },
+        ],
+      },
+    },
+    userStatusResp: {},
+    availableModelsResp: {},
+    nowEpoch: 1700000000,
+  });
+
+  assert.equal(quota.pools.gemini.label, 'Gemini');
+  assert.equal(quota.pools.gemini.five_hour.remaining_pct, 100);
+  assert.equal(quota.pools.gemini.five_hour.reset_time, null);
+  assert.equal(quota.pools['3p'].label, 'Claude/GPT');
+  assert.equal(quota.pools['3p'].five_hour.remaining_pct, 100);
+  assert.equal(quota.pools['3p'].five_hour.reset_time, null);
+  assert.equal(quota.model_pools.hydrogen, 'gemini');
+  assert.equal(quota.model_pools.neon, 'gemini');
+  assert.equal(quota.model_pools.argon, 'gemini');
+  assert.equal(quota.model_pools.carbon, 'gemini');
+  assert.equal(quota.model_pools.flash, 'gemini');
+  assert.equal(quota.model_pools.chatgpt, '3p');
+  assert.equal(quota.model_pools.haiku, '3p');
+});
+
+test('settings.json /model switch immediately overrides stale RPC step and reverts when new RPC turn runs', async (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const appDataDir = path.join(tmpDir, 'app-data');
+  fs.mkdirSync(appDataDir, { recursive: true });
+  const settingsPath = path.join(appDataDir, 'settings.json');
+  const initialSettingsText = JSON.stringify(
+    { model: 'Gemini 4 Hydrogen (XHigh)', statusLine: { command: 'existing-user-statusline' } },
+    null,
+    2
+  );
+  fs.writeFileSync(settingsPath, initialSettingsText);
+  // Ensure initial settings.json predates RPC refresh.
+  const past = new Date(Date.now() - 10_000);
+  fs.utimesSync(settingsPath, past, past);
+
+  let steps = [
+    {
+      stepIndices: [0],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M528',
+        modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+        usage: { inputTokens: '7559', outputTokens: '2686', cacheReadTokens: '269079' },
+      },
+    },
+  ];
+
+  const mock = await startMockLsServer(({ method }) => {
+    if (method === 'RetrieveUserQuotaSummary') return { body: buildMockQuotaSummaryPayload() };
+    if (method === 'GetUserStatus') return { body: buildMockUserStatusPayload() };
+    if (method === 'GetAvailableModels') return { body: buildMockModelsPayload() };
+    if (method === 'GetCascadeTrajectoryGeneratorMetadata') {
+      return { body: { generatorMetadata: steps } };
+    }
+    return { status: 404, body: {} };
+  });
+  t.after(() => mock.close());
+
+  const statusDir = path.join(tmpDir, 'status');
+  const projectDir = path.join(tmpDir, 'workspace');
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  // 1. Cold start: RPC step 1 (Gemini) is newer than old settings.json mtime.
+  const t1 = Date.now();
+  const res1 = await runRefresh({
+    statusDir,
+    pane: '20',
+    cwd: projectDir,
+    appDataDir,
+    nowMs: t1,
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch',
+      ANTIGRAVITY_CONVERSATION_ID: 'conv-switch-1',
+    },
+  });
+  assert.equal(res1.ok, true);
+  assert.equal(res1.pane.pool, 'gemini');
+  assert.equal(res1.pane.pool_label, 'Gemini');
+  assert.equal(res1.pane.model_display_name, 'Gemini 4 Hydrogen (XHigh)');
+  assert.equal(res1.pane.model_tracking.rpc_step_count, 1);
+  const rpcAt1 = res1.pane.model_tracking.rpc_model_at;
+  assert.ok(rpcAt1 > res1.pane.model_tracking.settings_model_changed_at);
+
+  // 2. Refresh again with unchanged rpc_step_count -> rpc_model_at MUST NOT bump.
+  const res2 = await runRefresh({
+    statusDir,
+    pane: '20',
+    cwd: projectDir,
+    appDataDir,
+    nowMs: t1 + 500,
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch',
+      ANTIGRAVITY_CONVERSATION_ID: 'conv-switch-1',
+    },
+  });
+  assert.equal(res2.pane.model_tracking.rpc_model_at, rpcAt1);
+
+  // 3. (4a) User runs /model in agy CLI -> settings.json switches to Claude Opus 5.5 (High),
+  // while GetCascadeTrajectoryGeneratorMetadata still has the previous Gemini step (rpc_step_count = 1).
+  const updatedSettingsText = JSON.stringify(
+    { model: 'Claude Opus 5.5 (High)', statusLine: { command: 'existing-user-statusline' } },
+    null,
+    2
+  );
+  fs.writeFileSync(settingsPath, updatedSettingsText);
+  const switchTime = new Date(t1 + 1000);
+  fs.utimesSync(settingsPath, switchTime, switchTime);
+
+  const res3 = await runRefresh({
+    statusDir,
+    pane: '20',
+    cwd: projectDir,
+    appDataDir,
+    nowMs: t1 + 1200,
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch',
+      ANTIGRAVITY_CONVERSATION_ID: 'conv-switch-1',
+    },
+  });
+  assert.equal(res3.pane.pool, '3p');
+  assert.equal(res3.pane.pool_label, 'Claude/GPT');
+  assert.equal(res3.pane.model_id, 'MODEL_PLACEHOLDER_M402');
+  assert.equal(res3.pane.model_display_name, 'Claude Opus 5.5 (High)');
+  assert.equal(res3.pane.model_tracking.settings_model, 'Claude Opus 5.5 (High)');
+  assert.equal(res3.pane.model_tracking.rpc_model_at, rpcAt1);
+  // Trajectory context from the last completed Gemini step remains accurate.
+  assert.equal(res3.pane.context.used_tokens, 279324);
+  assert.equal(res3.pane.context.context_window_size, 1048576);
+  // Verify settings.json was strictly read-only (statusLine & content untouched).
+  assert.equal(fs.readFileSync(settingsPath, 'utf8'), updatedSettingsText);
+
+  // 4. (4b) User later executes a Gemini turn -> rpc_step_count increases (1 -> 2),
+  // rpc_model_at advances and switches pane.pool back to "gemini".
+  steps = [
+    ...steps,
+    {
+      stepIndices: [1],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M528',
+        modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+        usage: { inputTokens: '8000', outputTokens: '3000', cacheReadTokens: '280000' },
+      },
+    },
+  ];
+  const res4 = await runRefresh({
+    statusDir,
+    pane: '20',
+    cwd: projectDir,
+    appDataDir,
+    nowMs: t1 + 3000,
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch',
+      ANTIGRAVITY_CONVERSATION_ID: 'conv-switch-1',
+    },
+  });
+  assert.equal(res4.pane.pool, 'gemini');
+  assert.equal(res4.pane.pool_label, 'Gemini');
+  assert.equal(res4.pane.model_id, 'MODEL_PLACEHOLDER_M528');
+  assert.equal(res4.pane.model_display_name, 'Gemini 4 Hydrogen (XHigh)');
+  assert.equal(res4.pane.model_tracking.rpc_step_count, 2);
+  assert.ok(res4.pane.model_tracking.rpc_model_at > res3.pane.model_tracking.settings_model_changed_at);
+
+  // 5. Optional <cwd>/.gemini/settings.json and WEZTERM_AGY_CLI_SETTINGS_PATH override.
+  const localGeminiDir = path.join(projectDir, '.gemini');
+  fs.mkdirSync(localGeminiDir, { recursive: true });
+  const localSettingsPath = path.join(localGeminiDir, 'settings.json');
+  fs.writeFileSync(localSettingsPath, JSON.stringify({ model: 'GPT-OSS 120B (Medium)' }));
+  const localTime = new Date(t1 + 4000);
+  fs.utimesSync(localSettingsPath, localTime, localTime);
+
+  const res5 = await runRefresh({
+    statusDir,
+    pane: '20',
+    cwd: projectDir,
+    cliSettingsPath: settingsPath,
+    nowMs: t1 + 4500,
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch',
+      ANTIGRAVITY_CONVERSATION_ID: 'conv-switch-1',
+    },
+  });
+  assert.equal(res5.pane.pool, '3p');
+  assert.equal(res5.pane.pool_label, 'Claude/GPT');
+  assert.equal(res5.pane.model_id, 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM');
+  assert.equal(res5.pane.model_display_name, 'GPT-OSS 120B (Medium)');
+
+  // 6. New conversation_id (via SessionStart hook or explicit conversationId) resets rpc_step_count = 0 and rpc_model_at = 0.
+  steps = [];
+  applyHookUpdate({
+    hookEvent: 'SessionStart',
+    payload: { conversationId: 'conv-new-session-2', cwd: projectDir },
+    env: { WEZTERM_PANE: '20', ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch' },
+    statusDir,
+    nowMs: t1 + 4900,
+  });
+  const res6 = await runRefresh({
+    statusDir,
+    pane: '20',
+    cwd: projectDir,
+    appDataDir,
+    nowMs: t1 + 5000,
+    env: {
+      WEZTERM_AGY_CLI_SETTINGS_PATH: settingsPath,
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch',
+    },
+  });
+  assert.equal(res6.pane.conversation_id, 'conv-new-session-2');
+  assert.equal(res6.pane.model_tracking.rpc_step_count, 0);
+  assert.equal(res6.pane.model_tracking.rpc_model_at, 0);
+  assert.equal(res6.pane.model_tracking.rpc_model, null);
+  assert.equal(res6.pane.context, null);
+  // Active settings model applies to fresh session immediately.
+  assert.equal(res6.pane.pool, '3p');
+  assert.equal(res6.pane.pool_label, 'Claude/GPT');
+
+  // 7. Fast real-clock /model switch right after an RPC turn (guards against Linux coarse inode mtime lag).
+  const fastAppDir = path.join(tmpDir, 'fast-app');
+  fs.mkdirSync(fastAppDir, { recursive: true });
+  const fastSettings = path.join(fastAppDir, 'settings.json');
+  fs.writeFileSync(fastSettings, JSON.stringify({ model: 'Gemini 4 Hydrogen (XHigh)' }));
+  steps = [
+    {
+      stepIndices: [0],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M528',
+        modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+        usage: { inputTokens: '1000', outputTokens: '200', cacheReadTokens: '3000' },
+      },
+    },
+  ];
+  const fast1 = await runRefresh({
+    statusDir,
+    pane: '23',
+    cwd: tmpDir,
+    appDataDir: fastAppDir,
+    conversationId: 'conv-fast-1',
+    env: { ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch' },
+  });
+  assert.equal(fast1.pane.pool, 'gemini');
+  fs.writeFileSync(fastSettings, JSON.stringify({ model: 'Claude Opus 5.5 (High)' }));
+  const fast2 = await runRefresh({
+    statusDir,
+    pane: '23',
+    cwd: tmpDir,
+    appDataDir: fastAppDir,
+    conversationId: 'conv-fast-1',
+    env: { ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-model-switch' },
+  });
+  assert.equal(fast2.pane.pool, '3p');
+  assert.equal(fast2.pane.pool_label, 'Claude/GPT');
+  assert.equal(fast2.pane.model_display_name, 'Claude Opus 5.5 (High)');
+});
+
+test('PreInvocation hook modelName updates hook_model_at and preserves 3p across unchanged RPC refreshes', async (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const appDataDir = path.join(tmpDir, 'app-data');
+  fs.mkdirSync(appDataDir, { recursive: true });
+  const settingsPath = path.join(appDataDir, 'settings.json');
+  fs.writeFileSync(settingsPath, JSON.stringify({ model: 'Gemini 4 Hydrogen (XHigh)' }));
+  const oldTime = new Date(Date.now() - 20_000);
+  fs.utimesSync(settingsPath, oldTime, oldTime);
+
+  const steps = [
+    {
+      stepIndices: [0],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M528',
+        modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+        usage: { inputTokens: '5000', outputTokens: '1000', cacheReadTokens: '100000' },
+      },
+    },
+  ];
+
+  const mock = await startMockLsServer(({ method, body }) => {
+    if (method === 'RetrieveUserQuotaSummary') return { body: buildMockQuotaSummaryPayload() };
+    if (method === 'GetUserStatus') return { body: buildMockUserStatusPayload() };
+    if (method === 'GetAvailableModels') return { body: buildMockModelsPayload() };
+    if (method === 'GetCascadeTrajectoryGeneratorMetadata') {
+      return { body: { generatorMetadata: body.cascadeId === 'conv-tie' ? [] : steps } };
+    }
+    return { status: 404, body: {} };
+  });
+  t.after(() => mock.close());
+
+  const statusDir = path.join(tmpDir, 'status');
+  const t0 = Date.now();
+
+  // 1. Initial refresh sees 1 Gemini step.
+  const r1 = await runRefresh({
+    statusDir,
+    pane: '21',
+    cwd: tmpDir,
+    appDataDir,
+    nowMs: t0,
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-hook-preserve',
+      ANTIGRAVITY_CONVERSATION_ID: 'conv-hook-preserve',
+    },
+  });
+  assert.equal(r1.pane.pool, 'gemini');
+  assert.equal(r1.pane.pool_label, 'Gemini');
+  assert.equal(r1.pane.model_tracking.rpc_step_count, 1);
+
+  // 2. (4c) PreInvocation hook fires with GPT-OSS 120B (Medium).
+  const hookRes = applyHookUpdate({
+    hookEvent: 'PreInvocation',
+    payload: {
+      conversationId: 'conv-hook-preserve',
+      modelName: 'GPT-OSS 120B (Medium)',
+      cwd: tmpDir,
+    },
+    env: {
+      WEZTERM_PANE: '21',
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-hook-preserve',
+    },
+    statusDir,
+    nowMs: t0 + 1000,
+  });
+  assert.equal(hookRes.panePayload.pool, '3p');
+  assert.equal(hookRes.panePayload.pool_label, 'Claude/GPT');
+  assert.equal(hookRes.panePayload.model_id, 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM');
+  assert.equal(hookRes.panePayload.model_display_name, 'GPT-OSS 120B (Medium)');
+  assert.equal(hookRes.panePayload.model_tracking.hook_model_at, t0 + 1000);
+  assert.equal(hookRes.panePayload.model_tracking.rpc_step_count, 1);
+
+  // 3. Subsequent runRefresh with unchanged rpc_step_count MUST preserve 3p instead of reverting to Gemini.
+  const r2 = await runRefresh({
+    statusDir,
+    pane: '21',
+    cwd: tmpDir,
+    appDataDir,
+    nowMs: t0 + 1500,
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-hook-preserve',
+      ANTIGRAVITY_CONVERSATION_ID: 'conv-hook-preserve',
+    },
+  });
+  assert.equal(r2.pane.pool, '3p');
+  assert.equal(r2.pane.pool_label, 'Claude/GPT');
+  assert.equal(r2.pane.model_id, 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM');
+  assert.equal(r2.pane.model_display_name, 'GPT-OSS 120B (Medium)');
+  assert.equal(r2.pane.model_tracking.rpc_model_at, t0);
+
+  // 4. Tie-break: hook_model_at (--model CLI flag) beats settings_model_changed_at when timestamps tie.
+  const tieTime = t0 + 2000;
+  fs.writeFileSync(settingsPath, JSON.stringify({ model: 'Gemini 4 Hydrogen (XHigh)' }));
+  fs.utimesSync(settingsPath, new Date(tieTime), new Date(tieTime));
+  applyHookUpdate({
+    hookEvent: 'PreInvocation',
+    payload: { conversationId: 'conv-tie', model: 'Claude Opus 5.5 (High)', cwd: tmpDir },
+    env: { WEZTERM_PANE: '22', ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-hook-preserve' },
+    statusDir,
+    nowMs: tieTime,
+  });
+  const rTie = await runRefresh({
+    statusDir,
+    pane: '22',
+    cwd: tmpDir,
+    appDataDir,
+    nowMs: tieTime + 50,
+    env: {
+      WEZTERM_AGY_CLI_SETTINGS_PATH: settingsPath,
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-hook-preserve',
+      ANTIGRAVITY_CONVERSATION_ID: 'conv-tie',
+    },
+  });
+  assert.equal(rTie.pane.model_tracking.hook_model_at, tieTime);
+  assert.equal(rTie.pane.model_tracking.settings_model_changed_at, tieTime);
+  assert.equal(rTie.pane.pool, '3p');
+  assert.equal(rTie.pane.model_display_name, 'Claude Opus 5.5 (High)');
+
+  // 5. End-to-end --hook PreInvocation CLI preserves 3p when RPC still has prior Gemini step.
+  const cliPre = await runChildAsync(process.execPath, [COLLECTOR_PATH, '--hook', 'PreInvocation'], {
+    input: JSON.stringify({
+      conversationId: 'conv-hook-preserve',
+      modelName: 'GPT-OSS 120B (Medium)',
+      cwd: tmpDir,
+      hookEventName: 'PreInvocation',
+    }),
+    env: {
+      ...process.env,
+      WEZTERM_AGY_STATUS_DIR: statusDir,
+      WEZTERM_AGY_CLI_SETTINGS_PATH: settingsPath,
+      WEZTERM_PANE: '21',
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-hook-preserve',
+    },
+  });
+  assert.equal(cliPre.status, 0);
+  assert.equal(cliPre.stdout, '{}\n');
+  const pane21AfterCli = readJsonSafe(getPanePath(statusDir, '21'));
+  assert.equal(pane21AfterCli.pool, '3p');
+  assert.equal(pane21AfterCli.pool_label, 'Claude/GPT');
+  assert.equal(pane21AfterCli.model_display_name, 'GPT-OSS 120B (Medium)');
 });
 

@@ -30,6 +30,11 @@ import {
   buildQuotaPayload,
   resolveModelMetadata,
 } from './lib/models.mjs';
+import {
+  computeModelTracking,
+  readActiveSettingsModel,
+  resolveActiveModelState,
+} from './lib/model-tracking.mjs';
 import { readConversationFromSqlite } from './lib/sqlite-fallback.mjs';
 import { computeContextMetrics, extractLatestRpcUsage } from './lib/usage.mjs';
 
@@ -93,11 +98,14 @@ export async function runRefresh({
   statusDir = getStatusDir(),
   pane = null,
   cwd = null,
+  conversationId: explicitConversationId = null,
   force = false,
   env = process.env,
   geminiBaseDir = null,
   appDataDir = null,
+  cliSettingsPath = null,
   rpcTimeoutMs = 2000,
+  nowMs = Date.now(),
 } = {}) {
   const paneId = sanitizePaneId(pane ?? env.WEZTERM_PANE);
   ensureCacheDirs(statusDir);
@@ -109,7 +117,8 @@ export async function runRefresh({
   }
 
   try {
-    const nowEpoch = Math.floor(Date.now() / 1000);
+    const effectiveNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+    const nowEpoch = Math.floor(effectiveNowMs / 1000);
     const endpointsStore = loadEndpoints(statusDir);
     const existingQuota = loadQuota(statusDir);
     const existingPane = loadPane(statusDir, paneId);
@@ -148,8 +157,9 @@ export async function runRefresh({
           ls_address: String(env.ANTIGRAVITY_LS_ADDRESS),
           csrf_token: String(env.ANTIGRAVITY_CSRF_TOKEN || prev?.csrf_token || ''),
           prefer_https: Boolean(activeEp.prefer_https),
-          conversation_id: env.ANTIGRAVITY_CONVERSATION_ID
+          conversation_id: explicitConversationId
             || existingPane?.conversation_id
+            || env.ANTIGRAVITY_CONVERSATION_ID
             || prev?.conversation_id
             || null,
           pid: prev?.pid || process.ppid || process.pid,
@@ -169,17 +179,17 @@ export async function runRefresh({
     }
 
     const paneEp = endpointsStore.endpoints[paneId];
-    let conversationId = existingPane?.conversation_id
+    let conversationId = explicitConversationId
+      || existingPane?.conversation_id
       || paneEp?.conversation_id
       || env.ANTIGRAVITY_CONVERSATION_ID
       || null;
     let effectiveCwd = cwd || existingPane?.cwd || null;
-    let agentState = existingPane?.agent_state || null;
+    let sqliteAgentState = null;
 
-    let modelId = null;
-    let modelDisplayName = null;
-    let pool = null;
-    let context = null;
+    let stepResolved = null;
+    let stepCount = 0;
+    let stepUsage = null;
 
     // 1. Official LS RPC trajectory usage when endpoint and conversation_id are available.
     if (lsQuota.ok && conversationId) {
@@ -187,30 +197,29 @@ export async function runRefresh({
       if (gmRes.ok && gmRes.items.length > 0) {
         const latestRpc = extractLatestRpcUsage(gmRes.items);
         if (latestRpc) {
-          const resolved = resolveModelMetadata({
+          stepResolved = resolveModelMetadata({
             modelId: latestRpc.model,
             modelDisplayName: latestRpc.modelDisplayName,
             responseModel: latestRpc.responseModel,
             chatStartMetadata: latestRpc.chatStartMetadata,
             modelIndex,
             modelPools: quotaPayload?.model_pools || {},
+            defaultPool: quotaPayload?.default_pool || 'gemini',
           });
-          modelId = resolved.model_id;
-          modelDisplayName = resolved.model_display_name;
-          pool = resolved.pool;
+          stepCount = gmRes.items.length;
           if (latestRpc.usage) {
-            context = computeContextMetrics({
-              ...latestRpc.usage,
-              contextWindowSize: resolved.context_window_size,
+            stepUsage = {
+              usage: latestRpc.usage,
+              windowSize: stepResolved.context_window_size,
               source: 'ls_rpc',
-            });
+            };
           }
         }
       }
     }
 
     // 2. Read-only SQLite fallback if LS RPC failed, conversation_id missing, or RPC had no usage.
-    if (!context) {
+    if (!stepUsage) {
       const sqliteData = await readConversationFromSqlite({
         conversationId,
         cwd: effectiveCwd,
@@ -223,7 +232,10 @@ export async function runRefresh({
         if (!effectiveCwd && sqliteData.cwd) {
           effectiveCwd = sqliteData.cwd;
         }
-        const resolved = resolveModelMetadata({
+        if (sqliteData.agentState) {
+          sqliteAgentState = sqliteData.agentState;
+        }
+        const sqliteResolved = resolveModelMetadata({
           modelEnumInt: sqliteData.modelEnumInt,
           modelDisplayName: sqliteData.modelDisplayName,
           responseModel: sqliteData.responseModel,
@@ -232,19 +244,18 @@ export async function runRefresh({
             : null,
           modelIndex,
           modelPools: quotaPayload?.model_pools || {},
+          defaultPool: quotaPayload?.default_pool || 'gemini',
         });
-        modelId = modelId || resolved.model_id;
-        modelDisplayName = modelDisplayName || resolved.model_display_name;
-        pool = pool || resolved.pool;
-        if (!agentState && sqliteData.agentState) {
-          agentState = sqliteData.agentState;
+        if (!stepResolved && (sqliteData.modelEnumInt || sqliteData.modelDisplayName || sqliteData.responseModel)) {
+          stepResolved = sqliteResolved;
+          stepCount = sqliteData.stepCount || 0;
         }
         if (sqliteData.usage) {
-          context = computeContextMetrics({
-            ...sqliteData.usage,
-            contextWindowSize: resolved.context_window_size,
+          stepUsage = {
+            usage: sqliteData.usage,
+            windowSize: sqliteResolved.context_window_size,
             source: 'sqlite',
-          });
+          };
         }
       }
     }
@@ -261,19 +272,79 @@ export async function runRefresh({
     }
 
     const finalConversationId = conversationId || latestOnDisk?.conversation_id || null;
+    const finalCwd = effectiveCwd || latestOnDisk?.cwd || null;
+    const baselinePane = (
+      latestOnDisk
+      && (!finalConversationId || !latestOnDisk.conversation_id || latestOnDisk.conversation_id === finalConversationId)
+    )
+      ? latestOnDisk
+      : existingPane;
+
+    const settingsInfo = readActiveSettingsModel({
+      cwd: finalCwd,
+      cliSettingsPath,
+      appDataDir,
+      geminiBaseDir,
+      env,
+    });
+
+    const stepModelName = stepResolved
+      ? (stepResolved.model_display_name || stepResolved.model_id)
+      : null;
+
+    const modelTracking = computeModelTracking({
+      prevPane: baselinePane,
+      conversationId: finalConversationId,
+      settingsInfo,
+      hookInput: null,
+      stepInput: stepModelName && stepCount > 0 ? { model: stepModelName, stepCount } : null,
+      nowMs: effectiveNowMs,
+    });
+
+    const sameConversation = Boolean(
+      !finalConversationId || !baselinePane?.conversation_id || baselinePane.conversation_id === finalConversationId
+    );
+    const activeModel = resolveActiveModelState({
+      modelTracking,
+      stepResolved,
+      prevPane: baselinePane,
+      sameConversation,
+      modelIndex,
+      modelPools: quotaPayload?.model_pools || {},
+      defaultPool: quotaPayload?.default_pool || 'gemini',
+    });
+
+    let context = null;
+    if (stepUsage) {
+      context = computeContextMetrics({
+        ...stepUsage.usage,
+        contextWindowSize: stepUsage.windowSize || activeModel.context_window_size || null,
+        source: stepUsage.source,
+      });
+    }
+
     const preservedContext = finalConversationId && latestOnDisk?.conversation_id === finalConversationId
       ? (latestOnDisk?.context ?? null)
       : null;
+
+    const agentStateOnDisk = latestOnDisk?.conversation_id === finalConversationId
+      ? latestOnDisk?.agent_state
+      : null;
+    const finalAgentState = agentStateOnDisk
+      || (sameConversation ? (existingPane?.agent_state || sqliteAgentState) : sqliteAgentState)
+      || 'idle';
 
     const finalPane = {
       version: 1,
       pane_id: paneId,
       conversation_id: finalConversationId,
-      cwd: effectiveCwd || latestOnDisk?.cwd || null,
-      model_id: modelId || latestOnDisk?.model_id || null,
-      model_display_name: modelDisplayName || latestOnDisk?.model_display_name || null,
-      pool: pool || latestOnDisk?.pool || quotaPayload?.default_pool || 'gemini',
-      agent_state: latestOnDisk?.agent_state || agentState || 'idle',
+      cwd: finalCwd,
+      model_id: activeModel.model_id,
+      model_display_name: activeModel.model_display_name,
+      pool: activeModel.pool,
+      pool_label: activeModel.pool_label,
+      model_tracking: modelTracking,
+      agent_state: finalAgentState,
       context: context || preservedContext,
       updated_at: nowEpoch,
     };
@@ -337,13 +408,13 @@ async function main() {
         }
       }
       const event = opts.hookEvent || payload.hookEventName || 'Unknown';
-      const { paneId, cwd } = applyHookUpdate({
+      const { paneId, cwd, conversationId } = applyHookUpdate({
         hookEvent: event,
         payload,
         env: process.env,
         statusDir,
       });
-      await runRefresh({ statusDir, pane: paneId, cwd, force: false });
+      await runRefresh({ statusDir, pane: paneId, cwd, conversationId, force: false });
     } catch (err) {
       debugLog('hook mode failed', err);
     } finally {
