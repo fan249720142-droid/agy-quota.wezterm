@@ -1,0 +1,39 @@
+{
+  "agy-quota-bridge": {
+    "SessionStart": [
+      {
+        "command": "node ./scripts/hook-bridge.mjs SessionStart",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "command": "node ./scripts/hook-bridge.mjs PreInvocation",
+        "timeout": 5
+      }
+    ],
+    "PostInvocation": [
+      {
+        "command": "node ./scripts/hook-bridge.mjs PostInvocation",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "command": "node ./scripts/hook-bridge.mjs PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "command": "node ./scripts/hook-bridge.mjs Stop",
+        "timeout": 5
+      }
+    ]
+  }
+}

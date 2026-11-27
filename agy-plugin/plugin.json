@@ -1,0 +1,5 @@
+{
+  "name": "agy-quota-wezterm-bridge",
+  "description": "Coexistence hook bridge feeding WezTerm status bar without touching settings.json statusLine",
+  "version": "0.1.0"
+}
