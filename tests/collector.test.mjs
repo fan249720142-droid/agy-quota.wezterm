@@ -18,8 +18,14 @@ import {
   resolveHomeDir,
   resolvePaneId,
 } from '../bin/lib/cache.mjs';
+import {
+  findAgyPidByTty,
+  findAncestorAgyPid,
+  inspectAgyProcess,
+  parseLsPortFromLogFile,
+} from '../bin/lib/agy-live.mjs';
 import { callLsRpc, discoverDaemonHubEndpoints } from '../bin/lib/ls-rpc.mjs';
-import { applyHookUpdate } from '../bin/lib/hook-handler.mjs';
+import { applyHookUpdate, deriveAgentState } from '../bin/lib/hook-handler.mjs';
 import { resolveCliSettingsPath } from '../bin/lib/model-tracking.mjs';
 import { buildQuotaPayload, classifyPoolByKeywords } from '../bin/lib/models.mjs';
 import {
@@ -1095,7 +1101,11 @@ test('settings.json /model switch immediately overrides stale RPC step and rever
   assert.equal(res6.pane.model_tracking.rpc_step_count, 0);
   assert.equal(res6.pane.model_tracking.rpc_model_at, 0);
   assert.equal(res6.pane.model_tracking.rpc_model, null);
-  assert.equal(res6.pane.context, null);
+  assert.equal(res6.pane.context.source, 'initial');
+  assert.equal(res6.pane.context.used_tokens, 0);
+  assert.equal(res6.pane.context.used_pct, 0);
+  assert.equal(res6.pane.context.cached_pct, 0);
+  assert.equal(res6.pane.context.context_window_size, 131072);
   // Active settings model applies to fresh session immediately.
   assert.equal(res6.pane.pool, '3p');
   assert.equal(res6.pane.pool_label, 'Claude/GPT');
@@ -1529,5 +1539,350 @@ test('Cross-platform path helpers preserve Linux paths and support Windows HOME/
   assert.equal(hubs.length, 1);
   assert.equal(hubs[0].ls_address, '127.0.0.1:50001');
 });
+
+test('/resume live process inspection switches conversation metrics immediately and resets on empty or fresh agy boot', async (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const appDataDir = path.join(tmpDir, 'app-data');
+  const convDir = path.join(appDataDir, 'conversations');
+  fs.mkdirSync(convDir, { recursive: true });
+  const settingsPath = path.join(appDataDir, 'settings.json');
+  fs.writeFileSync(settingsPath, JSON.stringify({ model: 'Claude Opus 5.5 (High)' }));
+
+  // Create a stale conversation DB on disk that must NEVER be grabbed on fresh agy boot.
+  const { DatabaseSync } = await loadSqlite();
+  const sumDb = new DatabaseSync(path.join(appDataDir, 'conversation_summaries.db'));
+  sumDb.exec(`
+    CREATE TABLE conversation_summaries (
+      conversation_id TEXT PRIMARY KEY,
+      workspace_uris TEXT NOT NULL,
+      status TEXT NOT NULL,
+      not_fully_idle INTEGER NOT NULL DEFAULT 0,
+      last_modified_time TEXT NOT NULL,
+      last_user_input_time TEXT NOT NULL
+    );
+  `);
+  const workspaceDir = path.join(tmpDir, 'ws');
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  sumDb.prepare('INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?)').run(
+    'conv-stale-db',
+    JSON.stringify([workspaceDir]),
+    'CASCADE_RUN_STATUS_IDLE',
+    0,
+    '2026-11-27 08:00:00.000+00:00',
+    '2026-11-27 08:00:00.000+00:00'
+  );
+  sumDb.close();
+  const staleConvDb = new DatabaseSync(path.join(convDir, 'conv-stale-db.db'));
+  staleConvDb.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER DEFAULT 0);');
+  staleConvDb.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(
+    0,
+    buildSyntheticGenMetadataBlob({ inputTokens: 99999, outputTokens: 1000, cacheReadTokens: 0 })
+  );
+  staleConvDb.close();
+
+  const mock = await startMockLsServer(({ method, body }) => {
+    if (method === 'RetrieveUserQuotaSummary') return { body: buildMockQuotaSummaryPayload() };
+    if (method === 'GetUserStatus') return { body: buildMockUserStatusPayload() };
+    if (method === 'GetAvailableModels') return { body: buildMockModelsPayload() };
+    if (method === 'GetCascadeTrajectoryGeneratorMetadata') {
+      if (body.cascadeId === 'conv-A') {
+        return {
+          body: {
+            generatorMetadata: [
+              {
+                stepIndices: [0],
+                chatModel: {
+                  model: 'MODEL_PLACEHOLDER_M402',
+                  modelDisplayName: 'Claude Opus 5.5 (High)',
+                  chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 512000 } },
+                  usage: { inputTokens: '10000', outputTokens: '5000', cacheReadTokens: '85000' },
+                },
+              },
+            ],
+          },
+        };
+      }
+      if (body.cascadeId === 'conv-B') {
+        return {
+          body: {
+            generatorMetadata: [
+              {
+                stepIndices: [0],
+                chatModel: {
+                  model: 'MODEL_PLACEHOLDER_M528',
+                  modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+                  // Option 1.B: catalog maxTokens (1048576) MUST take priority over chatStartMetadata (512000)
+                  chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 512000 } },
+                  usage: { inputTokens: '7559', outputTokens: '2686', cacheReadTokens: '269079' },
+                },
+              },
+            ],
+          },
+        };
+      }
+      return { body: { generatorMetadata: [] } };
+    }
+    return { status: 404, body: {} };
+  });
+  t.after(() => mock.close());
+
+  const statusDir = path.join(tmpDir, 'status');
+  const t0 = Date.now();
+
+  // 1. Initial conversation conv-A on agyPid 555 (100k tokens, Claude 5.5 -> 1,000,000 maxTokens)
+  const rA = await runRefresh({
+    statusDir,
+    pane: '1',
+    cwd: workspaceDir,
+    appDataDir,
+    agyPid: 555,
+    nowMs: t0,
+    inspectProcessFn: () => ({ alive: true, inspected: true, pid: 555, conversationId: 'conv-A', cwd: workspaceDir }),
+    env: { ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-resume' },
+  });
+  assert.equal(rA.ok, true);
+  assert.equal(rA.pane.agy_pid, 555);
+  assert.equal(rA.pane.conversation_id, 'conv-A');
+  assert.equal(rA.pane.pool, '3p');
+  assert.equal(rA.pane.context.used_tokens, 100000);
+  assert.equal(rA.pane.context.context_window_size, 1000000);
+  assert.equal(rA.pane.context.used_pct, 10);
+
+  // 2. User runs /resume to conv-B inside same agy process 555 (no explicit conversationId or agyPid passed!)
+  const rB = await runRefresh({
+    statusDir,
+    pane: '1',
+    cwd: workspaceDir,
+    appDataDir,
+    nowMs: t0 + 1000,
+    inspectProcessFn: (pid) => {
+      assert.equal(pid, 555);
+      return { alive: true, inspected: true, pid: 555, conversationId: 'conv-B', cwd: workspaceDir };
+    },
+    env: { ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-resume' },
+  });
+  assert.equal(rB.ok, true);
+  assert.equal(rB.pane.conversation_id, 'conv-B');
+  assert.equal(rB.pane.pool, 'gemini');
+  assert.equal(rB.pane.model_display_name, 'Gemini 4 Hydrogen (XHigh)');
+  assert.equal(rB.pane.context.source, 'ls_rpc');
+  assert.equal(rB.pane.context.used_tokens, 279324);
+  assert.equal(rB.pane.context.context_window_size, 1048576);
+  assert.equal(rB.pane.context.used_pct, 26.64);
+  assert.equal(rB.pane.context.cached_pct, 97.27);
+
+  // 3. /resume to an empty 0-step conversation -> clears conv-B's tokens and initializes 0-usage context
+  fs.writeFileSync(settingsPath, JSON.stringify({ model: 'Gemini 4 Hydrogen (High)' }));
+  const rEmpty = await runRefresh({
+    statusDir,
+    pane: '1',
+    cwd: workspaceDir,
+    appDataDir,
+    nowMs: t0 + 2000,
+    inspectProcessFn: () => ({ alive: true, inspected: true, pid: 555, conversationId: 'conv-empty', cwd: workspaceDir }),
+    env: { ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-resume' },
+  });
+  assert.equal(rEmpty.ok, true);
+  assert.equal(rEmpty.pane.conversation_id, 'conv-empty');
+  assert.equal(rEmpty.pane.model_tracking.rpc_step_count, 0);
+  assert.equal(rEmpty.pane.model_tracking.rpc_model, null);
+  assert.equal(rEmpty.pane.context.source, 'initial');
+  assert.equal(rEmpty.pane.context.used_tokens, 0);
+  assert.equal(rEmpty.pane.context.used_pct, 0);
+  assert.equal(rEmpty.pane.context.cached_pct, 0);
+  assert.equal(rEmpty.pane.context.remaining_pct, 100);
+  assert.equal(rEmpty.pane.context.context_window_size, 1048576);
+
+  // 4. Fresh agy boot (new pid 777, conversationId: null) -> never inherits conv-A/B or stale SQLite DB
+  // First switch pane back to conv-A with 100k tokens, then boot fresh agy 777
+  await runRefresh({
+    statusDir,
+    pane: '1',
+    cwd: workspaceDir,
+    appDataDir,
+    agyPid: 555,
+    nowMs: t0 + 2500,
+    inspectProcessFn: () => ({ alive: true, inspected: true, pid: 555, conversationId: 'conv-A', cwd: workspaceDir }),
+    env: { ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-resume' },
+  });
+  fs.writeFileSync(settingsPath, JSON.stringify({ model: 'Claude Opus 5.5 (High)' }));
+  const rFresh = await runRefresh({
+    statusDir,
+    pane: '1',
+    cwd: workspaceDir,
+    appDataDir,
+    agyPid: 777,
+    nowMs: t0 + 3000,
+    inspectProcessFn: () => ({ alive: true, inspected: true, pid: 777, conversationId: null, cwd: workspaceDir }),
+    env: { ANTIGRAVITY_LS_ADDRESS: mock.address, ANTIGRAVITY_CSRF_TOKEN: 'tok-resume' },
+  });
+  assert.equal(rFresh.ok, true);
+  assert.equal(rFresh.pane.agy_pid, 777);
+  assert.equal(rFresh.pane.conversation_id, null);
+  assert.equal(rFresh.pane.pool, '3p');
+  assert.equal(rFresh.pane.model_display_name, 'Claude Opus 5.5 (High)');
+  assert.equal(rFresh.pane.model_tracking.rpc_step_count, 0);
+  assert.equal(rFresh.pane.model_tracking.rpc_model, null);
+  assert.equal(rFresh.pane.context.source, 'initial');
+  assert.equal(rFresh.pane.context.used_tokens, 0);
+  assert.equal(rFresh.pane.context.used_pct, 0);
+  assert.equal(rFresh.pane.context.cached_pct, 0);
+  assert.equal(rFresh.pane.context.context_window_size, 1000000);
+});
+
+test('UserPromptSubmit state derivation and hook-bridge --force argument passing work cleanly', async (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  assert.equal(deriveAgentState('UserPromptSubmit', {}, 'idle'), 'working');
+
+  const statusDir = path.join(tmpDir, 'status');
+  const argsOut = path.join(tmpDir, 'spawned-args.json');
+  const mockCollector = path.join(tmpDir, 'record-collector.mjs');
+  fs.writeFileSync(
+    mockCollector,
+    `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(argsOut)}, JSON.stringify(process.argv.slice(2)));\n`
+  );
+
+  // Seed existing pane with an old conversation_id to verify hook-bridge does NOT forward stale existingPane.conversation_id
+  applyHookUpdate({
+    hookEvent: 'Stop',
+    payload: { conversationId: 'conv-stale-old', cwd: '/home/xiaolu/old' },
+    agyPid: 111,
+    env: { WEZTERM_PANE: '33' },
+    statusDir,
+  });
+
+  const bridgeEnv = {
+    ...process.env,
+    WEZTERM_AGY_STATUS_DIR: statusDir,
+    WEZTERM_AGY_COLLECTOR_BIN: mockCollector,
+    WEZTERM_PANE: '33',
+  };
+  delete bridgeEnv.ANTIGRAVITY_CONVERSATION_ID;
+  delete bridgeEnv.ANTIGRAVITY_LS_ADDRESS;
+  delete bridgeEnv.ANTIGRAVITY_CSRF_TOKEN;
+
+  const proc = await runChildAsync(process.execPath, [HOOK_BRIDGE_PATH, 'UserPromptSubmit'], {
+    input: JSON.stringify({ cwd: '/home/xiaolu/new-ws', hookEventName: 'UserPromptSubmit' }),
+    env: bridgeEnv,
+  });
+  assert.equal(proc.status, 0);
+  assert.equal(proc.stdout, '{}\n');
+
+  let spawnedArgs = null;
+  for (let i = 0; i < 40; i++) {
+    if (fs.existsSync(argsOut)) {
+      spawnedArgs = JSON.parse(fs.readFileSync(argsOut, 'utf8'));
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(spawnedArgs, 'hook-bridge should spawn collector with arguments');
+  assert.ok(spawnedArgs.includes('--refresh'));
+  assert.ok(spawnedArgs.includes('--force'));
+  assert.ok(spawnedArgs.includes('--pane'));
+  assert.equal(spawnedArgs[spawnedArgs.indexOf('--pane') + 1], '33');
+  assert.equal(spawnedArgs.includes('--conversation-id'), false, 'must NOT forward stale existingPane.conversation_id');
+
+  const pane33 = readJsonSafe(getPanePath(statusDir, '33'));
+  assert.equal(pane33.agent_state, 'working');
+});
+
+test('Linux /proc live helpers parse ancestor PID, TTY PID, LS log ports, and open FDs', (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const procRoot = path.join(tmpDir, 'proc');
+  const mkProc = (pid, { ppid, comm, cmdline, starttime = 100, fd0 = null, cwd = null, fds = {} }) => {
+    const pDir = path.join(procRoot, String(pid));
+    fs.mkdirSync(path.join(pDir, 'fd'), { recursive: true });
+    // Build Linux /proc/<pid>/stat with 22 fields (rest[1]=ppid, rest[19]=starttime)
+    const fieldsAfterComm = new Array(20).fill('0');
+    fieldsAfterComm[0] = 'S';
+    fieldsAfterComm[1] = String(ppid);
+    fieldsAfterComm[19] = String(starttime);
+    fs.writeFileSync(path.join(pDir, 'stat'), `${pid} (${comm}) ${fieldsAfterComm.join(' ')}\n`);
+    fs.writeFileSync(path.join(pDir, 'comm'), `${comm}\n`);
+    fs.writeFileSync(path.join(pDir, 'cmdline'), cmdline);
+    if (fd0) fs.symlinkSync(fd0, path.join(pDir, 'fd', '0'));
+    if (cwd) fs.symlinkSync(cwd, path.join(pDir, 'cwd'));
+    for (const [fdNum, target] of Object.entries(fds)) {
+      fs.symlinkSync(target, path.join(pDir, 'fd', fdNum));
+    }
+  };
+
+  const logPath = path.join(tmpDir, 'cli-20261127_180000.log');
+  fs.writeFileSync(
+    logPath,
+    '2026-11-27T18:00:00Z INFO starting...\n'
+    + 'Language server listening on random port at 41234 for HTTP\n'
+    + 'Language server listening on random port at 41235 for HTTPS\n'
+  );
+  assert.deepEqual(parseLsPortFromLogFile(logPath), { httpPort: 41234, httpsPort: 41235 });
+
+  const uuidDb = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const uuidLock = '11111111-2222-3333-4444-555555555555';
+  const workDir = path.join(tmpDir, 'project');
+  fs.mkdirSync(workDir, { recursive: true });
+
+  // Process tree: 10 (bash) -> 200 (agy) -> 300 (sh) -> 400 (node hook-bridge)
+  mkProc(10, { ppid: 1, comm: 'bash', cmdline: '-bash\0' });
+  mkProc(200, {
+    ppid: 10,
+    comm: 'agy',
+    cmdline: '/usr/local/bin/agy\0--model\0gemini\0',
+    starttime: 500,
+    fd0: '/dev/pts/9',
+    cwd: workDir,
+    fds: {
+      1: logPath,
+      16: `/home/xiaolu/.gemini/antigravity-cli/conversations/${uuidDb}.db-wal`,
+      17: `/home/xiaolu/.gemini/antigravity-cli/conversations/${uuidDb}.db`,
+      18: `/home/xiaolu/.gemini/antigravity-cli/presence/${uuidLock}.lock`,
+    },
+  });
+  // Newer agy process on same TTY (welcome screen only, no conversation .db or .lock)
+  mkProc(250, {
+    ppid: 10,
+    comm: 'agy-cli',
+    cmdline: 'agy-cli\0',
+    starttime: 900,
+    fd0: '/dev/pts/9',
+    cwd: workDir,
+    fds: { 1: logPath },
+  });
+  mkProc(300, { ppid: 200, comm: 'sh', cmdline: 'sh\0-c\0node\0' });
+  mkProc(400, { ppid: 300, comm: 'node', cmdline: 'node\0hook-bridge.mjs\0' });
+
+  assert.equal(findAncestorAgyPid(400, procRoot), 200);
+  assert.equal(findAncestorAgyPid(10, procRoot), null);
+  assert.equal(findAgyPidByTty('/dev/pts/9', procRoot), 250);
+  assert.equal(findAgyPidByTty('/dev/pts/99', procRoot), null);
+
+  // inspectAgyProcess on PID 200 prefers .db over .lock and ignores -wal
+  const info200 = inspectAgyProcess(200, { procRoot });
+  assert.equal(info200.alive, true);
+  assert.equal(info200.inspected, true);
+  assert.equal(info200.pid, 200);
+  assert.equal(info200.conversationId, uuidDb);
+  assert.equal(info200.logPath, logPath);
+  assert.equal(info200.httpPort, 41234);
+  assert.equal(info200.httpsPort, 41235);
+  assert.equal(info200.cwd, workDir);
+
+  // inspectAgyProcess on PID 250 (welcome screen) returns conversationId: null, inspected: true
+  const info250 = inspectAgyProcess(250, { procRoot });
+  assert.equal(info250.alive, true);
+  assert.equal(info250.inspected, true);
+  assert.equal(info250.conversationId, null);
+
+  // inspectAgyProcess on non-agy PID or missing PID returns alive: false
+  assert.deepEqual(inspectAgyProcess(300, { procRoot }), { alive: false, inspected: false });
+  assert.deepEqual(inspectAgyProcess(999999, { procRoot }), { alive: false, inspected: false });
+});
+
 
 

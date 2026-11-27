@@ -19,6 +19,7 @@ import {
   savePane,
   saveQuota,
 } from './lib/cache.mjs';
+import { findAgyPidByTty, findAncestorAgyPid, inspectAgyProcess } from './lib/agy-live.mjs';
 import { applyHookUpdate, readStdinAsync } from './lib/hook-handler.mjs';
 import {
   buildEndpointCandidates,
@@ -43,6 +44,9 @@ export function parseArgs(argv) {
     mode: 'refresh',
     pane: null,
     cwd: null,
+    agyPid: null,
+    tty: null,
+    conversationId: null,
     force: false,
     hookEvent: null,
   };
@@ -63,6 +67,18 @@ export function parseArgs(argv) {
       opts.cwd = argv[++i];
     } else if (arg.startsWith('--cwd=')) {
       opts.cwd = arg.slice('--cwd='.length);
+    } else if (arg === '--agy-pid' && i + 1 < argv.length) {
+      opts.agyPid = argv[++i];
+    } else if (arg.startsWith('--agy-pid=')) {
+      opts.agyPid = arg.slice('--agy-pid='.length);
+    } else if (arg === '--tty' && i + 1 < argv.length) {
+      opts.tty = argv[++i];
+    } else if (arg.startsWith('--tty=')) {
+      opts.tty = arg.slice('--tty='.length);
+    } else if (arg === '--conversation-id' && i + 1 < argv.length) {
+      opts.conversationId = argv[++i];
+    } else if (arg.startsWith('--conversation-id=')) {
+      opts.conversationId = arg.slice('--conversation-id='.length);
     } else if (arg === '--hook') {
       opts.mode = 'hook';
       if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) {
@@ -106,6 +122,10 @@ export async function runRefresh({
   cliSettingsPath = null,
   rpcTimeoutMs = 2000,
   nowMs = Date.now(),
+  agyPid = null,
+  tty = null,
+  inspectProcessFn = null,
+  procRoot = '/proc',
 } = {}) {
   const effectiveStatusDir = statusDir || getStatusDir(env);
   const paneId = resolvePaneId(pane, env);
@@ -124,6 +144,24 @@ export async function runRefresh({
     const existingQuota = loadQuota(effectiveStatusDir);
     const existingPane = loadPane(effectiveStatusDir, paneId);
     const cachedLimits = loadModelLimitsCache(effectiveStatusDir);
+
+    const parsedAgyPid = agyPid !== null && agyPid !== undefined && String(agyPid).trim() !== ''
+      ? Number(agyPid)
+      : NaN;
+    const explicitPid = Number.isInteger(parsedAgyPid) && parsedAgyPid > 0 ? parsedAgyPid : null;
+    const ttyPid = !explicitPid && tty ? findAgyPidByTty(tty, procRoot) : null;
+    const resolvedAgyPid = explicitPid || ttyPid || (!tty ? existingPane?.agy_pid : null) || null;
+
+    const inspector = inspectProcessFn || inspectAgyProcess;
+    const liveProc = resolvedAgyPid ? inspector(resolvedAgyPid, { procRoot }) : null;
+    const activeLivePid = liveProc?.alive
+      ? (liveProc.pid || resolvedAgyPid)
+      : (explicitPid || ttyPid || null);
+    const pidChanged = Boolean(
+      activeLivePid
+      && existingPane?.agy_pid
+      && Number(activeLivePid) !== Number(existingPane.agy_pid)
+    );
 
     const candidates = buildEndpointCandidates({
       paneId,
@@ -159,11 +197,11 @@ export async function runRefresh({
           csrf_token: String(env.ANTIGRAVITY_CSRF_TOKEN || prev?.csrf_token || ''),
           prefer_https: Boolean(activeEp.prefer_https),
           conversation_id: explicitConversationId
-            || existingPane?.conversation_id
+            || liveProc?.conversationId
+            || (pidChanged ? null : (existingPane?.conversation_id || prev?.conversation_id))
             || env.ANTIGRAVITY_CONVERSATION_ID
-            || prev?.conversation_id
             || null,
-          pid: prev?.pid || process.ppid || process.pid,
+          pid: activeLivePid || (pidChanged ? null : prev?.pid) || process.ppid || process.pid,
           updated_at: nowEpoch,
         };
         endpointsStore.latest_key = paneId;
@@ -180,12 +218,14 @@ export async function runRefresh({
     }
 
     const paneEp = endpointsStore.endpoints[paneId];
-    let conversationId = explicitConversationId
-      || existingPane?.conversation_id
-      || paneEp?.conversation_id
-      || env.ANTIGRAVITY_CONVERSATION_ID
-      || null;
-    let effectiveCwd = cwd || existingPane?.cwd || null;
+    let conversationId = liveProc?.inspected
+      ? (explicitConversationId || liveProc.conversationId || null)
+      : (explicitConversationId
+        || (pidChanged ? null : existingPane?.conversation_id)
+        || (!pidChanged ? paneEp?.conversation_id : null)
+        || env.ANTIGRAVITY_CONVERSATION_ID
+        || null);
+    let effectiveCwd = cwd || liveProc?.cwd || (pidChanged ? null : existingPane?.cwd) || null;
     let sqliteAgentState = null;
 
     let stepResolved = null;
@@ -219,8 +259,13 @@ export async function runRefresh({
       }
     }
 
-    // 2. Read-only SQLite fallback if LS RPC failed, conversation_id missing, or RPC had no usage.
-    if (!stepUsage) {
+    // 2. Read-only SQLite fallback if LS RPC failed or had no usage.
+    // Never fall back to arbitrary cwd DBs when live inspection confirms no conversation is open or PID changed without conversationId.
+    const allowSqliteFallback = Boolean(
+      conversationId
+      || (!(liveProc?.inspected && !liveProc.conversationId) && !pidChanged)
+    );
+    if (!stepUsage && allowSqliteFallback) {
       const sqliteData = await readConversationFromSqlite({
         conversationId,
         cwd: effectiveCwd,
@@ -273,12 +318,23 @@ export async function runRefresh({
       return { ok: true, skipped: true, reason: 'superseded', paneId };
     }
 
-    const finalConversationId = conversationId || latestOnDisk?.conversation_id || null;
-    const finalCwd = effectiveCwd || latestOnDisk?.cwd || null;
-    const baselinePane = (
-      latestOnDisk
-      && (!finalConversationId || !latestOnDisk.conversation_id || latestOnDisk.conversation_id === finalConversationId)
-    )
+    const prevConvId = latestOnDisk?.conversation_id ?? existingPane?.conversation_id ?? null;
+    const finalConversationId = liveProc?.inspected
+      ? (conversationId || null)
+      : (conversationId || (pidChanged ? null : latestOnDisk?.conversation_id) || null);
+    const finalCwd = effectiveCwd || (pidChanged ? null : latestOnDisk?.cwd) || null;
+
+    const sessionReset = Boolean(
+      pidChanged
+      || (prevConvId !== null && (finalConversationId || null) !== prevConvId)
+    );
+    const sameConversation = Boolean(
+      !sessionReset
+      && (finalConversationId
+        ? (!latestOnDisk?.conversation_id || latestOnDisk.conversation_id === finalConversationId)
+        : !latestOnDisk?.conversation_id)
+    );
+    const baselinePane = (!sessionReset && latestOnDisk && sameConversation)
       ? latestOnDisk
       : existingPane;
 
@@ -300,12 +356,10 @@ export async function runRefresh({
       settingsInfo,
       hookInput: null,
       stepInput: stepModelName && stepCount > 0 ? { model: stepModelName, stepCount } : null,
+      sessionReset,
       nowMs: effectiveNowMs,
     });
 
-    const sameConversation = Boolean(
-      !finalConversationId || !baselinePane?.conversation_id || baselinePane.conversation_id === finalConversationId
-    );
     const activeModel = resolveActiveModelState({
       modelTracking,
       stepResolved,
@@ -316,6 +370,16 @@ export async function runRefresh({
       defaultPool: quotaPayload?.default_pool || 'gemini',
     });
 
+    const preservedContext = (
+      sameConversation
+      && finalConversationId
+      && latestOnDisk?.conversation_id === finalConversationId
+      && latestOnDisk?.context
+      && latestOnDisk.context.source !== 'initial'
+    )
+      ? latestOnDisk.context
+      : null;
+
     let context = null;
     if (stepUsage) {
       context = computeContextMetrics({
@@ -323,13 +387,19 @@ export async function runRefresh({
         contextWindowSize: stepUsage.windowSize || activeModel.context_window_size || null,
         source: stepUsage.source,
       });
+    } else if (preservedContext) {
+      context = preservedContext;
+    } else {
+      context = computeContextMetrics({
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        contextWindowSize: activeModel.context_window_size || null,
+        source: 'initial',
+      });
     }
 
-    const preservedContext = finalConversationId && latestOnDisk?.conversation_id === finalConversationId
-      ? (latestOnDisk?.context ?? null)
-      : null;
-
-    const agentStateOnDisk = latestOnDisk?.conversation_id === finalConversationId
+    const agentStateOnDisk = (!sessionReset && latestOnDisk?.conversation_id === finalConversationId)
       ? latestOnDisk?.agent_state
       : null;
     const finalAgentState = agentStateOnDisk
@@ -339,6 +409,7 @@ export async function runRefresh({
     const finalPane = {
       version: 1,
       pane_id: paneId,
+      agy_pid: activeLivePid || (!pidChanged ? (latestOnDisk?.agy_pid ?? existingPane?.agy_pid ?? null) : null),
       conversation_id: finalConversationId,
       cwd: finalCwd,
       model_id: activeModel.model_id,
@@ -347,7 +418,7 @@ export async function runRefresh({
       pool_label: activeModel.pool_label,
       model_tracking: modelTracking,
       agent_state: finalAgentState,
-      context: context || preservedContext,
+      context,
       updated_at: nowEpoch,
     };
 
@@ -388,7 +459,7 @@ async function main() {
 
   if (opts.mode === 'help') {
     process.stderr.write(
-      'Usage: agy-status-collector.mjs [--refresh [--pane <id>] [--cwd <dir>] [--force]] [--hook <event>] [--dump]\n'
+      'Usage: agy-status-collector.mjs [--refresh [--pane <id>] [--cwd <dir>] [--agy-pid <pid>] [--tty <path>] [--conversation-id <cid>] [--force]] [--hook <event>] [--dump]\n'
     );
     return;
   }
@@ -410,13 +481,22 @@ async function main() {
         }
       }
       const event = opts.hookEvent || payload.hookEventName || 'Unknown';
+      const agyPid = findAncestorAgyPid();
       const { paneId, cwd, conversationId } = applyHookUpdate({
         hookEvent: event,
         payload,
+        agyPid,
         env: process.env,
         statusDir,
       });
-      await runRefresh({ statusDir, pane: paneId, cwd, conversationId, force: false });
+      await runRefresh({
+        statusDir,
+        pane: paneId,
+        cwd,
+        conversationId,
+        agyPid,
+        force: true,
+      });
     } catch (err) {
       debugLog('hook mode failed', err);
     } finally {
@@ -425,10 +505,14 @@ async function main() {
     return;
   }
 
+  const agyPid = opts.agyPid || (!opts.tty ? findAncestorAgyPid() : null);
   await runRefresh({
     statusDir,
     pane: opts.pane,
     cwd: opts.cwd,
+    conversationId: opts.conversationId,
+    agyPid,
+    tty: opts.tty,
     force: opts.force,
   });
 }

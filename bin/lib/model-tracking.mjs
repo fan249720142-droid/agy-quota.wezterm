@@ -108,6 +108,7 @@ export function computeModelTracking({
   settingsInfo = undefined,
   hookInput = null,
   stepInput = null,
+  sessionReset = false,
   nowMs = Date.now(),
 } = {}) {
   const prevTracking = prevPane?.model_tracking && typeof prevPane.model_tracking === 'object'
@@ -117,13 +118,14 @@ export function computeModelTracking({
 
   const prevConvId = prevPane?.conversation_id || null;
   const conversationChanged = Boolean(conversationId && prevConvId && prevConvId !== conversationId);
+  const resetConv = Boolean(sessionReset || conversationChanged);
 
-  const prevRpcModel = conversationChanged ? null : (prevTracking?.rpc_model || null);
-  const prevRpcStepCount = conversationChanged ? 0 : toNonNegInt(prevTracking?.rpc_step_count);
-  const prevRpcModelAt = conversationChanged ? 0 : toNonNegInt(prevTracking?.rpc_model_at);
+  const prevRpcModel = resetConv ? null : (prevTracking?.rpc_model || null);
+  const prevRpcStepCount = resetConv ? 0 : toNonNegInt(prevTracking?.rpc_step_count);
+  const prevRpcModelAt = resetConv ? 0 : toNonNegInt(prevTracking?.rpc_model_at);
 
-  const prevHookModel = conversationChanged ? null : (prevTracking?.hook_model || null);
-  const prevHookModelAt = conversationChanged ? 0 : toNonNegInt(prevTracking?.hook_model_at);
+  const prevHookModel = resetConv ? null : (prevTracking?.hook_model || null);
+  const prevHookModelAt = resetConv ? 0 : toNonNegInt(prevTracking?.hook_model_at);
 
   let settingsModel = prevTracking?.settings_model ?? null;
   let settingsModelChangedAt = toNonNegInt(prevTracking?.settings_model_changed_at);

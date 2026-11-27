@@ -50,6 +50,7 @@ export function deriveAgentState(hookEvent, payload, previousState) {
   switch (hookEvent) {
     case 'SessionStart':
       return 'idle';
+    case 'UserPromptSubmit':
     case 'PreInvocation':
     case 'PostToolUse':
       return 'working';
@@ -83,6 +84,7 @@ export function applyHookUpdate({
   hookEvent,
   payload = {},
   pane = null,
+  agyPid = null,
   env = process.env,
   statusDir = getStatusDir(env),
   nowMs = Date.now(),
@@ -98,21 +100,32 @@ export function applyHookUpdate({
   const cachedLimits = loadModelLimitsCache(statusDir);
   const modelIndex = buildModelIndex(null, [], cachedLimits);
 
-  const conversationId = payload.conversationId
+  const parsedAgyPid = agyPid !== null && agyPid !== undefined && String(agyPid).trim() !== ''
+    ? Number(agyPid)
+    : NaN;
+  const resolvedAgyPid = Number.isInteger(parsedAgyPid) && parsedAgyPid > 0 ? parsedAgyPid : null;
+  const pidChanged = Boolean(
+    resolvedAgyPid
+    && existingPane?.agy_pid
+    && Number(resolvedAgyPid) !== Number(existingPane.agy_pid)
+  );
+
+  const explicitConvId = payload.conversationId
     || payload.conversation_id
     || payload.cascadeId
     || env.ANTIGRAVITY_CONVERSATION_ID
-    || existingPane?.conversation_id
-    || existingEp?.conversation_id
+    || null;
+  const conversationId = explicitConvId
+    || (pidChanged ? null : (existingPane?.conversation_id || existingEp?.conversation_id))
     || null;
 
   const cwd = payload.cwd
     || (Array.isArray(payload.workspacePaths) && payload.workspacePaths[0])
-    || existingPane?.cwd
+    || (pidChanged ? null : existingPane?.cwd)
     || process.cwd();
 
-  const lsAddress = env.ANTIGRAVITY_LS_ADDRESS || existingEp?.ls_address || null;
-  const csrfToken = env.ANTIGRAVITY_CSRF_TOKEN || existingEp?.csrf_token || '';
+  const lsAddress = env.ANTIGRAVITY_LS_ADDRESS || (!pidChanged ? existingEp?.ls_address : null) || null;
+  const csrfToken = env.ANTIGRAVITY_CSRF_TOKEN || (!pidChanged ? existingEp?.csrf_token : '') || '';
 
   if (lsAddress) {
     const preferHttps = existingEp?.ls_address === lsAddress
@@ -123,14 +136,17 @@ export function applyHookUpdate({
       csrf_token: String(csrfToken),
       prefer_https: preferHttps,
       conversation_id: conversationId,
-      pid: process.ppid || process.pid,
+      pid: resolvedAgyPid || process.ppid || process.pid,
       updated_at: effectiveNowEpoch,
     };
     endpointsStore.latest_key = paneId;
     saveEndpoints(statusDir, endpointsStore);
   }
 
-  const sameConversation = Boolean(!conversationId || !existingPane?.conversation_id || existingPane.conversation_id === conversationId);
+  const sameConversation = Boolean(
+    !pidChanged
+    && (!conversationId || !existingPane?.conversation_id || existingPane.conversation_id === conversationId)
+  );
   const rawModelName = extractHookModel(payload);
 
   const modelTracking = computeModelTracking({
@@ -139,6 +155,7 @@ export function applyHookUpdate({
     settingsInfo: undefined,
     hookInput: rawModelName ? { model: rawModelName, at: effectiveNowMs } : null,
     stepInput: null,
+    sessionReset: pidChanged,
     nowMs: effectiveNowMs,
   });
 
@@ -156,6 +173,7 @@ export function applyHookUpdate({
   const panePayload = {
     version: 1,
     pane_id: paneId,
+    agy_pid: resolvedAgyPid || (!pidChanged ? (existingPane?.agy_pid ?? null) : null),
     conversation_id: conversationId,
     cwd,
     model_id: activeModel.model_id,

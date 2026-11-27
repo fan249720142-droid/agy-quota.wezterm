@@ -27,12 +27,13 @@ function resolveRepoPaths() {
   return {
     hookHandlerPath: path.join(repoRoot, 'bin', 'lib', 'hook-handler.mjs'),
     cachePath: path.join(repoRoot, 'bin', 'lib', 'cache.mjs'),
+    agyLivePath: path.join(repoRoot, 'bin', 'lib', 'agy-live.mjs'),
     collectorPath,
   };
 }
 
 async function run() {
-  const { hookHandlerPath, cachePath, collectorPath } = resolveRepoPaths();
+  const { hookHandlerPath, cachePath, agyLivePath, collectorPath } = resolveRepoPaths();
   let debugLog = (msg, err) => {
     if (process.env.WEZTERM_AGY_DEBUG === '1') {
       process.stderr.write(`[agy-hook] ${msg}: ${err?.message || err}\n`);
@@ -40,9 +41,12 @@ async function run() {
   };
 
   try {
-    const [{ applyHookUpdate, readStdinAsync }, cacheMod] = await Promise.all([
+    const [{ applyHookUpdate, readStdinAsync }, cacheMod, agyLiveMod] = await Promise.all([
       import(pathToFileURL(hookHandlerPath).href),
       import(pathToFileURL(cachePath).href),
+      fs.existsSync(agyLivePath)
+        ? import(pathToFileURL(agyLivePath).href).catch(() => null)
+        : Promise.resolve(null),
     ]);
     debugLog = cacheMod.debugLog;
 
@@ -57,6 +61,13 @@ async function run() {
       }
     }
 
+    let agyPid = null;
+    try {
+      agyPid = agyLiveMod?.findAncestorAgyPid?.() || null;
+    } catch {
+      agyPid = null;
+    }
+
     const hookEvent = process.argv[2] || payload.hookEventName || 'Unknown';
     const statusDir = cacheMod.getStatusDir();
     const { paneId, cwd } = applyHookUpdate({
@@ -64,12 +75,25 @@ async function run() {
       payload,
       env: process.env,
       statusDir,
+      agyPid,
     });
 
+    const explicitConvId = payload.conversationId
+      || payload.conversation_id
+      || payload.cascadeId
+      || process.env.ANTIGRAVITY_CONVERSATION_ID
+      || null;
+
     if (fs.existsSync(collectorPath)) {
-      const args = [collectorPath, '--refresh', '--pane', paneId];
+      const args = [collectorPath, '--refresh', '--force', '--pane', paneId];
       if (cwd) {
         args.push('--cwd', cwd);
+      }
+      if (agyPid) {
+        args.push('--agy-pid', String(agyPid));
+      }
+      if (explicitConvId) {
+        args.push('--conversation-id', String(explicitConvId));
       }
       const child = spawn(process.execPath, args, {
         detached: true,
