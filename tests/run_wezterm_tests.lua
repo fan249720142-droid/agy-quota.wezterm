@@ -231,6 +231,8 @@ test("responsive full / compact / minimal rendering and colors", function()
     is_agy = true,
     has_quota = true,
     has_pane = true,
+    pool_key = "gemini",
+    pool_label = "Gemini",
     context = {
       cached_pct = 99.1,
       used_pct = 35.9,
@@ -247,57 +249,116 @@ test("responsive full / compact / minimal rendering and colors", function()
     },
   }
 
+  local function has_fg_color(cells, color)
+    for i = 1, #cells do
+      local item = cells[i]
+      if item.Foreground and item.Foreground.Color == color then
+        return true
+      end
+    end
+    return false
+  end
+
   local full_cells = render.render_cells(snap, 160, { layout = "auto" })
   local full_text = render.cells_to_plain_text(full_cells)
   assert_eq(
     full_text,
-    "Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
+    "Gemini │ Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
     "full layout text"
   )
+  assert_eq(
+    render.cells_to_plain_text(render.render_cells(snap, 140, { layout = "auto" })),
+    full_text,
+    "full layout threshold at 140 cols"
+  )
 
-  -- Verify countdown color #57caff and bar empty color #3b4052 exist in full cells
-  local found_countdown_color = false
-  local found_empty_bar_color = false
-  for i = 1, #full_cells do
-    local item = full_cells[i]
-    if item.Foreground and item.Foreground.Color == "#57caff" then
-      found_countdown_color = true
-    end
-    if item.Foreground and item.Foreground.Color == "#3b4052" then
-      found_empty_bar_color = true
-    end
-  end
-  assert_true(found_countdown_color, "countdown uses #57caff")
-  assert_true(found_empty_bar_color, "empty bar uses #3b4052")
+  -- Verify countdown color #57caff, bar empty color #3b4052, and gemini pool color #89b4fa
+  assert_true(has_fg_color(full_cells, "#57caff"), "countdown uses #57caff")
+  assert_true(has_fg_color(full_cells, "#3b4052"), "empty bar uses #3b4052")
+  assert_true(has_fg_color(full_cells, "#89b4fa"), "gemini pool uses #89b4fa")
 
   local compact_cells = render.render_cells(snap, 105, { layout = "auto" })
+  local compact_text = render.cells_to_plain_text(compact_cells)
   assert_eq(
-    render.cells_to_plain_text(compact_cells),
-    "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
+    compact_text,
+    "Gemini │ C 99% │ Ctx 35.9% █░░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
     "compact layout text at 105 cols"
   )
 
   local minimal_cells = render.render_cells(snap, 80, { layout = "auto" })
   assert_eq(
     render.cells_to_plain_text(minimal_cells),
-    "C 99% │ Ctx 36% │ 5h 49% 1h21m │ Wk 86% 6d20h",
-    "minimal layout text at 80 cols"
+    "Gem │ Ctx 36% │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
+    "minimal layout text at 80 cols keeps 5h/Wk progress bars"
   )
 
-  -- Context hiding outside agy
+  -- 3p / Claude & GPT pool rendering, short label in minimal, and pool color overrides/fallback
+  local snap_3p = {
+    now = now,
+    is_agy = true,
+    has_quota = true,
+    has_pane = true,
+    pool_key = "3p",
+    pool_label = "Claude & GPT",
+    context = {
+      cached_pct = 97.6,
+      used_pct = 37.7,
+      used_tokens = 395400,
+      context_window_size = 1000000,
+    },
+    five_hour = {
+      remaining_pct = 59,
+      reset_epoch = now + 13980, -- 3h53m
+    },
+    weekly = {
+      remaining_pct = 86,
+      reset_epoch = now + 518400, -- 6d0h
+    },
+  }
+  local compact_3p = render.render_cells(snap_3p, 105, { layout = "auto" })
+  assert_eq(
+    render.cells_to_plain_text(compact_3p),
+    "Claude/GPT │ C 98% │ Ctx 37.7% ██░░ 395k/1.0M │ 5h 59% ██░░ 3h53m │ Wk 86% ███░ 6d0h",
+    "3p compact layout text"
+  )
+  assert_true(has_fg_color(compact_3p, "#d4bdf5"), "3p pool uses #d4bdf5")
+
+  local minimal_3p = render.render_cells(snap_3p, 80, { layout = "auto" })
+  assert_eq(
+    render.cells_to_plain_text(minimal_3p),
+    "Cld │ Ctx 38% │ 5h 59% ██░░ 3h53m │ Wk 86% ███░ 6d0h",
+    "3p minimal layout text"
+  )
+
+  local fallback_3p = render.render_cells(snap_3p, 105, {
+    colors = { pool_3p = false, pool = "#f5c2e7" },
+  })
+  assert_true(has_fg_color(fallback_3p, "#f5c2e7"), "3p falls back to colors.pool when pool_3p unset")
+
+  -- Completely hidden outside agy by default (only_when_agy = true)
   snap.is_agy = false
-  local outside_default = render.render_cells(snap, 105, { hide_context_outside_agy = true })
+  local outside_hidden = render.render_cells(snap, 105, {})
+  assert_eq(#outside_hidden, 0, "completely hidden outside agy when only_when_agy is default true")
+
+  -- Context hiding outside agy when only_when_agy = false
+  local outside_default = render.render_cells(snap, 105, {
+    only_when_agy = false,
+    hide_context_outside_agy = true,
+  })
   assert_eq(
     render.cells_to_plain_text(outside_default),
-    "5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
-    "context hidden outside agy"
+    "Gemini │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
+    "context hidden outside agy when only_when_agy=false"
   )
 
-  local outside_shown = render.render_cells(snap, 105, { show_context_outside_agy = true })
+  local outside_shown = render.render_cells(snap, 105, {
+    only_when_agy = false,
+    show_context_outside_agy = true,
+  })
   assert_eq(
     render.cells_to_plain_text(outside_shown),
-    "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
-    "context shown outside agy when configured"
+    "Gemini │ C 99% │ Ctx 35.9% █░░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
+    "context shown outside agy when configured with only_when_agy=false"
   )
 end)
 
@@ -431,8 +492,19 @@ test("JSON cache reading, memory throttling, malformed JSON safety, and stale re
     assert_eq(spawns[1][6], "--cwd", "argv --cwd")
     assert_eq(spawns[1][7], "/home/xiaolu/project", "argv cwd")
 
-    state.get_snapshot(pane, opts, 1002)
-    assert_eq(#spawns, 1, "spawn cooldown (>=4s) prevents rapid respawn")
+    state.get_snapshot(pane, opts, 1001)
+    assert_eq(#spawns, 1, "spawn cooldown (>=2s) prevents rapid respawn")
+
+    -- Even if user passes spawn_cooldown_secs = 1, non-forced spawns clamp cooldown >= 2s
+    local opts_low_cd = {
+      cache_dir = tmp_dir,
+      node_bin = "/usr/local/bin/node",
+      collector_script = "/opt/agy/bin/agy-status-collector.mjs",
+      spawn_cooldown_secs = 1,
+      spawn_fn = opts.spawn_fn,
+    }
+    state.get_snapshot(pane, opts_low_cd, 1001.5)
+    assert_eq(#spawns, 1, "spawn_cooldown_secs clamped >= 2s when not forced")
 
     -- 2. Malformed JSON never throws
     write_file(tmp_dir .. "/quota.json", "{broken json")
@@ -477,7 +549,7 @@ test("JSON cache reading, memory throttling, malformed JSON safety, and stale re
       }]]
     )
 
-    -- Within 1s read throttle from 1005 -> still cached bad nil until 1006.1
+    -- Within 1s read throttle from 1005 -> still cached bad nil until 1006
     local s_throttled = state.get_snapshot(pane, opts, 1005.5)
     assert_eq(s_throttled.has_quota, false, "1s cache read throttle holds previous read")
 
@@ -489,7 +561,7 @@ test("JSON cache reading, memory throttling, malformed JSON safety, and stale re
     )
     assert_eq(
       render.cells_to_plain_text(cells_t0),
-      "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
+      "Gemini │ C 99% │ Ctx 35.9% █░░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
       "countdown at now=1006"
     )
 
@@ -502,22 +574,27 @@ test("JSON cache reading, memory throttling, malformed JSON safety, and stale re
     local cells_t1 = render.render_cells(s_fresh, 105, {})
     assert_eq(
       render.cells_to_plain_text(cells_t1),
-      "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h20m │ Wk 86% █████░ 6d19h",
+      "Gemini │ C 99% │ Ctx 35.9% █░░░ 376k/1.0M │ 5h 49% ██░░ 1h20m │ Wk 86% ███░ 6d19h",
       "countdown ticks dynamically at now=1007"
     )
 
-    -- At 1011 (1006 + 5s = active_poll_interval_secs), active agy pane triggers spawn!
-    local s_pane_stale = state.get_snapshot(pane, opts, 1011)
-    assert_eq(s_pane_stale.pane_stale, true, "active pane stale after 5s")
-    assert_eq(#spawns, 3, "active agy pane triggers refresh at 5s")
+    -- At 1008 (1006 + 2s < 3s), active pane not yet stale
+    local s_pane_fresh = state.get_snapshot(pane, opts, 1008)
+    assert_eq(s_pane_fresh.pane_stale, false, "active pane fresh before 3s")
+    assert_eq(#spawns, 2, "no spawn before 3s active poll interval")
+
+    -- At 1009 (1006 + 3s = active_poll_interval_secs), active agy pane triggers spawn!
+    local s_pane_stale = state.get_snapshot(pane, opts, 1009)
+    assert_eq(s_pane_stale.pane_stale, true, "active pane stale after 3s")
+    assert_eq(#spawns, 3, "active agy pane triggers refresh at 3s")
 
     -- Manual trigger_refresh forces spawn & clears read cache
-    local triggered = state.trigger_refresh(pane, opts, 1011)
+    local triggered = state.trigger_refresh(pane, opts, 1009)
     assert_true(triggered, "trigger_refresh succeeds")
     assert_eq(#spawns, 4, "trigger_refresh spawned")
 
-    -- Non-agy bash pane: fresh quota (<30s) does NOT spawn even when pane_<id>.json missing;
-    -- stale quota (>=30s) DOES spawn.
+    -- Non-agy bash pane: when only_when_agy = true (default), even stale quota (>=30s)
+    -- does NOT spawn unless force == true or only_when_agy == false.
     local bash_pane = make_mock_pane({
       id = 77,
       cols = 105,
@@ -533,7 +610,17 @@ test("JSON cache reading, memory throttling, malformed JSON safety, and stale re
 
     local sb2 = state.get_snapshot(bash_pane, opts, 1036) -- 1036 - 1006 = 30s >= 30s
     assert_eq(sb2.quota_stale, true, "quota stale at 30s")
-    assert_eq(#spawns, count_before_bash + 1, "stale quota triggers refresh even in bash pane")
+    assert_eq(#spawns, count_before_bash, "stale quota does NOT spawn in bash pane when only_when_agy=true")
+
+    local opts_show_always = {
+      cache_dir = tmp_dir,
+      node_bin = "/usr/local/bin/node",
+      collector_script = "/opt/agy/bin/agy-status-collector.mjs",
+      only_when_agy = false,
+      spawn_fn = opts.spawn_fn,
+    }
+    state.get_snapshot(bash_pane, opts_show_always, 1036)
+    assert_eq(#spawns, count_before_bash + 1, "stale quota spawns in bash pane when only_when_agy=false")
 
     -- Derived used_pct when pane json omits used_pct
     write_file(
@@ -571,11 +658,21 @@ test("node_bin and collector_script auto-resolution and empty/placeholder render
   local collector = state.resolve_collector_script({ plugin_dir = REPO_ROOT .. "/plugin" })
   assert_true(type(collector) == "string" and collector:find("agy%-status%-collector%.mjs$") ~= nil, "collector_script auto-resolved")
 
-  local empty_cells = render.render_cells({ is_agy = false, has_quota = false }, 105, {})
-  assert_eq(render.cells_to_plain_text(empty_cells), "5h -- │ Wk --", "placeholder when empty")
+  local outside_empty = render.render_cells({ is_agy = false, has_quota = false }, 105, {})
+  assert_eq(#outside_empty, 0, "outside agy renders empty cells by default")
 
-  local hidden_cells = render.render_cells({ is_agy = false, has_quota = false }, 105, { hide_when_empty = true })
+  local empty_cells = render.render_cells({ is_agy = true, has_quota = false }, 105, {})
+  assert_eq(render.cells_to_plain_text(empty_cells), "5h -- │ Wk --", "placeholder when empty inside agy")
+
+  local hidden_cells = render.render_cells({ is_agy = true, has_quota = false }, 105, { hide_when_empty = true })
   assert_eq(#hidden_cells, 0, "hide_when_empty returns empty cell list")
+
+  local outside_placeholder = render.render_cells(
+    { is_agy = false, has_quota = false },
+    105,
+    { only_when_agy = false }
+  )
+  assert_eq(render.cells_to_plain_text(outside_placeholder), "5h -- │ Wk --", "placeholder when only_when_agy=false")
 end)
 
 test("composable API, layout cycling, and apply_to_config integration", function()
@@ -629,7 +726,7 @@ test("composable API, layout cycling, and apply_to_config integration", function
     local cells = plugin.get_status_cells(win, pane, nil, 2000)
     assert_eq(
       render.cells_to_plain_text(cells),
-      "Cache 99.1% │ Ctx 35.9% ██░░░░ 376k/1.0M │ 5h 49% ███░░░ 1h21m │ Wk 86% █████░ 6d20h",
+      "Gemini │ C 99% │ Ctx 35.9% █░░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
       "get_status_cells output"
     )
 
@@ -653,7 +750,7 @@ test("composable API, layout cycling, and apply_to_config integration", function
     local wide_win = make_mock_window(100, narrow_split_pane, 150)
     assert_eq(
       render.cells_to_plain_text(plugin.get_status_cells(wide_win, narrow_split_pane, nil, 2000)),
-      "Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
+      "Gemini │ Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
       "tab:get_size().cols determines full-bar layout even on narrow split pane"
     )
 
@@ -662,11 +759,21 @@ test("composable API, layout cycling, and apply_to_config integration", function
     assert_eq(plugin.cycle_layout(win), "full", "cycle -> full")
     assert_eq(
       render.cells_to_plain_text(plugin.get_status_cells(win, pane, nil, 2000)),
-      "Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
+      "Gemini │ Cached 99.1% │ Context 35.9% ███░░░░░ 376.2k/1.0M │ Five Hours 49% ████░░░░ 1h21m │ Weekly 86% ███████░ 6d20h",
       "overridden full layout on 105-col pane"
     )
     assert_eq(plugin.cycle_layout(win), "compact", "cycle -> compact")
+    assert_eq(
+      render.cells_to_plain_text(plugin.get_status_cells(win, pane, nil, 2000)),
+      "Gemini │ C 99% │ Ctx 35.9% █░░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
+      "overridden compact layout"
+    )
     assert_eq(plugin.cycle_layout(win), "minimal", "cycle -> minimal")
+    assert_eq(
+      render.cells_to_plain_text(plugin.get_status_cells(win, pane, nil, 2000)),
+      "Gem │ Ctx 36% │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
+      "overridden minimal layout"
+    )
     assert_eq(plugin.cycle_layout(win), "auto", "cycle -> auto")
 
     -- apply_to_config on a real wezterm.config_builder() preserving existing keys
@@ -674,7 +781,7 @@ test("composable API, layout cycling, and apply_to_config integration", function
     write_file(
       tmp_dir .. "/quota.json",
       string.format(
-        '{"version":1,"fetched_at":%d,"default_pool":"gemini","pools":{"gemini":{"five_hour":{"remaining_pct":49,"reset_epoch":%d},"weekly":{"remaining_pct":86,"reset_epoch":%d}}}}',
+        '{"version":1,"fetched_at":%d,"default_pool":"gemini","pools":{"gemini":{"label":"Gemini","five_hour":{"remaining_pct":49,"reset_epoch":%d},"weekly":{"remaining_pct":86,"reset_epoch":%d}}}}',
         real_now,
         real_now + 4860,
         real_now + 590400
@@ -710,13 +817,225 @@ test("composable API, layout cycling, and apply_to_config integration", function
     -- Trigger registered update-status event and verify window:set_right_status output
     wezterm.emit("update-status", win, pane)
     assert_true(type(win._last_right_status) == "string" and #win._last_right_status > 0, "update-status sets right status")
-    assert_true(win._last_right_status:find("99%.1%%") ~= nil, "right status includes cached pct")
+    assert_true(win._last_right_status:find("Gemini") ~= nil, "right status includes Gemini pool label")
+    assert_true(win._last_right_status:find("35%.9%%") ~= nil, "right status includes context pct")
     assert_true(win._last_right_status:find("~/work") ~= nil, "right status includes appended cwd")
   end)
   remove_dir(tmp_dir)
   if not ok then
     error(err)
   end
+end)
+
+test("only_when_agy hides shell panes, skips spawn_fn, and omits standalone separator", function()
+  local tmp_dir = make_temp_dir()
+  local ok, err = pcall(function()
+    state.reset()
+    local spawn_count = 0
+    local bash_pane = make_mock_pane({
+      id = 55,
+      cols = 105,
+      cwd = "/home/xiaolu/work",
+      proc_info = { executable = "/bin/bash", name = "bash", children = {} },
+    })
+    local win = make_mock_window(201, bash_pane)
+
+    plugin.setup({
+      cache_dir = tmp_dir,
+      append_cwd = false,
+      append_time = false,
+      spawn_fn = function()
+        spawn_count = spawn_count + 1
+      end,
+    })
+
+    local cells = plugin.get_status_cells(win, bash_pane, nil, 3000)
+    assert_eq(#cells, 0, "is_agy=false returns empty cells")
+    assert_eq(plugin.get_status_text(win, bash_pane, nil, 3000), "", "is_agy=false returns empty text")
+    assert_eq(spawn_count, 0, "is_agy=false does NOT call spawn_fn")
+
+    wezterm.emit("update-status", win, bash_pane)
+    assert_eq(win._last_right_status, "", "update-status sets empty string outside agy when no extras")
+    assert_eq(spawn_count, 0, "update-status on bash pane does NOT call spawn_fn")
+
+    plugin.setup({
+      cache_dir = tmp_dir,
+      append_cwd = true,
+      append_time = true,
+      spawn_fn = function()
+        spawn_count = spawn_count + 1
+      end,
+    })
+    wezterm.emit("update-status", win, bash_pane)
+    assert_true(type(win._last_right_status) == "string" and win._last_right_status:find("~/work") ~= nil, "cwd still rendered when append_cwd=true")
+    assert_true(win._last_right_status:find("│") == nil, "no leading separator emitted when quota cells are empty")
+    assert_eq(spawn_count, 0, "still zero spawn_fn calls on bash pane")
+  end)
+  remove_dir(tmp_dir)
+  if not ok then
+    error(err)
+  end
+end)
+
+test("switching pane_<id>.json from gemini to 3p immediately updates pool label, quotas, and colors", function()
+  local tmp_dir = make_temp_dir()
+  local ok, err = pcall(function()
+    state.reset()
+    write_file(
+      tmp_dir .. "/quota.json",
+      [[{
+        "version": 1,
+        "fetched_at": 4000,
+        "default_pool": "gemini",
+        "pools": {
+          "gemini": {
+            "label": "Gemini",
+            "five_hour": { "remaining_pct": 59, "reset_epoch": 17980 },
+            "weekly": { "remaining_pct": 86, "reset_epoch": 522400 }
+          },
+          "3p": {
+            "label": "Claude & GPT",
+            "five_hour": { "remaining_pct": 24, "reset_epoch": 11200 },
+            "weekly": { "remaining_pct": 71, "reset_epoch": 350000 }
+          }
+        }
+      }]]
+    )
+    write_file(
+      tmp_dir .. "/panes/pane_9.json",
+      [[{
+        "version": 1,
+        "pane_id": 9,
+        "model_id": "gemini-3-pro",
+        "pool": "gemini",
+        "context": {
+          "used_tokens": 395400,
+          "context_window_size": 1000000,
+          "used_pct": 37.7,
+          "cached_pct": 97.6
+        },
+        "updated_at": 4000
+      }]]
+    )
+
+    local pane = make_mock_pane({
+      id = 9,
+      cols = 105,
+      cwd = "/home/xiaolu/work",
+      proc_info = { executable = "/home/xiaolu/.local/bin/agy", name = "agy", children = {} },
+    })
+    local win = make_mock_window(202, pane)
+
+    plugin.setup({
+      cache_dir = tmp_dir,
+      spawn_fn = function() end,
+    })
+
+    local function has_color(cells, hex)
+      for i = 1, #cells do
+        local item = cells[i]
+        if item.Foreground and item.Foreground.Color == hex then
+          return true
+        end
+      end
+      return false
+    end
+
+    local gem_cells = plugin.get_status_cells(win, pane, nil, 4000)
+    local gem_text = render.cells_to_plain_text(gem_cells)
+    assert_eq(
+      gem_text,
+      "Gemini │ C 98% │ Ctx 37.7% ██░░ 395k/1.0M │ 5h 59% ██░░ 3h53m │ Wk 86% ███░ 6d0h",
+      "initial gemini pool bar"
+    )
+    assert_true(has_color(gem_cells, "#89b4fa"), "gemini pool uses #89b4fa")
+    assert_true(utf8.len(gem_text) <= 85, "compact gemini width fits comfortably on 105 cols")
+
+    local gem_min_text = render.cells_to_plain_text(plugin.get_status_cells(win, pane, { layout = "minimal" }, 4000))
+    assert_eq(
+      gem_min_text,
+      "Gem │ Ctx 38% │ 5h 59% ██░░ 3h53m │ Wk 86% ███░ 6d0h",
+      "initial gemini minimal bar"
+    )
+    assert_eq(utf8.len(gem_min_text), 52, "minimal layout is exactly 52 display chars")
+
+    -- Switch model/pool in pane_9.json from gemini to 3p (Claude/GPT)
+    write_file(
+      tmp_dir .. "/panes/pane_9.json",
+      [[{
+        "version": 1,
+        "pane_id": 9,
+        "model_id": "claude-sonnet-4-5",
+        "pool": "3p",
+        "context": {
+          "used_tokens": 395400,
+          "context_window_size": 1000000,
+          "used_pct": 37.7,
+          "cached_pct": 97.6
+        },
+        "updated_at": 4001
+      }]]
+    )
+
+    local claude_cells = plugin.get_status_cells(win, pane, nil, 4001.5)
+    local claude_text = render.cells_to_plain_text(claude_cells)
+    assert_eq(
+      claude_text,
+      "Claude/GPT │ C 98% │ Ctx 37.7% ██░░ 395k/1.0M │ 5h 24% █░░░ 1h59m │ Wk 71% ███░ 4d0h",
+      "switched immediately to Claude/GPT pool and 3p quota percentages"
+    )
+    assert_true(has_color(claude_cells, "#d4bdf5"), "3p pool uses #d4bdf5")
+    assert_true(utf8.len(claude_text) <= 90, "compact Claude/GPT width fits comfortably on 105 cols")
+
+    local claude_min_text = render.cells_to_plain_text(plugin.get_status_cells(win, pane, { layout = "minimal" }, 4001.5))
+    assert_eq(
+      claude_min_text,
+      "Cld │ Ctx 38% │ 5h 24% █░░░ 1h59m │ Wk 71% ███░ 4d0h",
+      "switched minimal bar to Cld and 3p percentages"
+    )
+    assert_eq(utf8.len(claude_min_text), 52, "minimal Cld layout is exactly 52 display chars")
+
+    -- Verify custom pane_data.pool_label is preserved in snapshot for non-3p/gemini custom pools
+    write_file(
+      tmp_dir .. "/panes/pane_9.json",
+      [[{
+        "version": 1,
+        "pane_id": 9,
+        "pool": "3p",
+        "pool_label": "My Custom Label",
+        "updated_at": 4003
+      }]]
+    )
+    local snap_custom = plugin.get_snapshot(pane, nil, 4003)
+    assert_eq(snap_custom.pool_label, "My Custom Label", "state keeps pane_data.pool_label")
+  end)
+  remove_dir(tmp_dir)
+  if not ok then
+    error(err)
+  end
+end)
+
+test("apply_to_config supports tab_bar_at_bottom option", function()
+  local cfg_true = wezterm.config_builder()
+  plugin.apply_to_config(cfg_true, {
+    register_status_event = false,
+    tab_bar_at_bottom = true,
+  })
+  assert_eq(cfg_true.tab_bar_at_bottom, true, "sets tab_bar_at_bottom = true")
+
+  local cfg_false = wezterm.config_builder()
+  plugin.apply_to_config(cfg_false, {
+    register_status_event = false,
+    tab_bar_at_bottom = false,
+  })
+  assert_eq(cfg_false.tab_bar_at_bottom, false, "sets tab_bar_at_bottom = false")
+
+  local cfg_untouched = wezterm.config_builder()
+  cfg_untouched.tab_bar_at_bottom = false
+  plugin.apply_to_config(cfg_untouched, {
+    register_status_event = false,
+  })
+  assert_eq(cfg_untouched.tab_bar_at_bottom, false, "leaves tab_bar_at_bottom untouched when nil")
 end)
 
 if failed > 0 then

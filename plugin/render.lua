@@ -2,18 +2,20 @@ local M = {}
 
 M.DEFAULTS = {
   layout = "auto", -- "auto" | "full" | "compact" | "minimal"
+  only_when_agy = true,
   default_cols = 105,
   cols_offset = 0,
-  full_min_cols = 145,
+  full_min_cols = 140,
   compact_min_cols = 100,
   full_bar_width = 8,
-  compact_bar_width = 6,
+  compact_bar_width = 4,
+  minimal_bar_width = 4,
   bar_filled_char = "█",
   bar_empty_char = "░",
   separator = " │ ",
   hide_context_outside_agy = true,
   hide_when_empty = false,
-  show_pool = false,
+  show_pool = true,
   colors = {
     label = "#a9b0c2",
     tokens = "#8c92a4",
@@ -22,6 +24,8 @@ M.DEFAULTS = {
     bar_empty = "#3b4052",
     muted = "#6c7386",
     pool = "#e6dcc3",
+    pool_gemini = "#89b4fa",
+    pool_3p = "#d4bdf5",
   },
 }
 
@@ -33,10 +37,13 @@ local STOPS = {
 
 local LAYOUT_SPECS = {
   full = {
+    mode = "full",
+    show_cache = true,
     cache_label = "Cached",
     cache_decimals = 1,
     ctx_label = "Context",
     ctx_decimals = 1,
+    show_ctx_bar = true,
     five_hour_label = "Five Hours",
     weekly_label = "Weekly",
     bar_width_key = "full_bar_width",
@@ -45,26 +52,32 @@ local LAYOUT_SPECS = {
     token_mode = "full",
   },
   compact = {
-    cache_label = "Cache",
-    cache_decimals = 1,
+    mode = "compact",
+    show_cache = true,
+    cache_label = "C",
+    cache_decimals = 0,
     ctx_label = "Ctx",
     ctx_decimals = 1,
+    show_ctx_bar = true,
     five_hour_label = "5h",
     weekly_label = "Wk",
     bar_width_key = "compact_bar_width",
-    default_bar_width = 6,
+    default_bar_width = 4,
     show_tokens = true,
     token_mode = "compact",
   },
   minimal = {
+    mode = "minimal",
+    show_cache = false,
     cache_label = "C",
     cache_decimals = 0,
     ctx_label = "Ctx",
     ctx_decimals = 0,
+    show_ctx_bar = false,
     five_hour_label = "5h",
     weekly_label = "Wk",
-    bar_width_key = nil,
-    default_bar_width = 0,
+    bar_width_key = "minimal_bar_width",
+    default_bar_width = 4,
     show_tokens = false,
     token_mode = nil,
   },
@@ -198,10 +211,53 @@ local function resolve_colors(opts)
     for k, v in pairs(opts.colors) do
       if type(v) == "string" and v ~= "" then
         colors[k] = v
+      elseif v == false then
+        colors[k] = nil
       end
     end
   end
   return colors
+end
+
+local function classify_pool_kind(pool_key, pool_label)
+  local key = type(pool_key) == "string" and pool_key:lower() or ""
+  local lbl = type(pool_label) == "string" and pool_label:lower() or ""
+  if key == "3p"
+    or key:find("claude", 1, true)
+    or key:find("gpt", 1, true)
+    or key:find("3p", 1, true)
+    or lbl:find("claude", 1, true)
+    or lbl:find("gpt", 1, true)
+    or lbl:find("3p", 1, true)
+  then
+    return "3p"
+  end
+  if key == "gemini"
+    or key:find("gemini", 1, true)
+    or lbl:find("gemini", 1, true)
+  then
+    return "gemini"
+  end
+  return "other"
+end
+
+local function resolve_pool_presentation(snapshot, mode, colors)
+  local raw_key = type(snapshot.pool_key) == "string" and snapshot.pool_key ~= "" and snapshot.pool_key or nil
+  local raw_label = type(snapshot.pool_label) == "string" and snapshot.pool_label ~= "" and snapshot.pool_label or nil
+  if not raw_key and not raw_label then
+    return nil, nil
+  end
+
+  local kind = classify_pool_kind(raw_key, raw_label)
+  if kind == "3p" then
+    local text = (mode == "minimal") and "Cld" or "Claude/GPT"
+    return text, colors.pool_3p or colors.pool
+  end
+  if kind == "gemini" then
+    local text = (mode == "minimal") and "Gem" or "Gemini"
+    return text, colors.pool_gemini or colors.pool
+  end
+  return raw_label or raw_key, colors.pool
 end
 
 function M.resolve_layout_mode(cols, opts)
@@ -281,6 +337,15 @@ end
 function M.render_cells(snapshot, cols, opts)
   opts = opts or M.DEFAULTS
   snapshot = snapshot or {}
+
+  local only_when_agy = opts.only_when_agy
+  if only_when_agy == nil then
+    only_when_agy = M.DEFAULTS.only_when_agy
+  end
+  if only_when_agy ~= false and snapshot.is_agy ~= true then
+    return {}
+  end
+
   local mode = M.resolve_layout_mode(cols, opts)
   local spec = LAYOUT_SPECS[mode]
   local colors = resolve_colors(opts)
@@ -299,18 +364,31 @@ function M.render_cells(snapshot, cols, opts)
     hide_outside = not opts.show_context_outside_agy
   end
 
+  local show_pool = opts.show_pool
+  if show_pool == nil then
+    show_pool = M.DEFAULTS.show_pool
+  end
+
+  local hide_when_empty = opts.hide_when_empty
+  if hide_when_empty == nil then
+    hide_when_empty = M.DEFAULTS.hide_when_empty
+  end
+
   local show_context = (snapshot.is_agy == true) or (not hide_outside)
   local ctx = snapshot.context
   local segments = {}
 
-  if opts.show_pool and type(snapshot.pool_label) == "string" and snapshot.pool_label ~= "" then
-    add_segment(segments, function(seg)
-      push_text(seg, colors.pool, snapshot.pool_label)
-    end)
+  if show_pool then
+    local pool_text, pool_color = resolve_pool_presentation(snapshot, mode, colors)
+    if pool_text then
+      add_segment(segments, function(seg)
+        push_text(seg, pool_color, pool_text)
+      end)
+    end
   end
 
   if show_context and type(ctx) == "table" then
-    if ctx.cached_pct ~= nil then
+    if spec.show_cache and ctx.cached_pct ~= nil then
       add_segment(segments, function(seg)
         push_text(seg, colors.label, spec.cache_label .. " ")
         push_text(seg, M.cached_color(ctx.cached_pct), format_pct(ctx.cached_pct, spec.cache_decimals))
@@ -322,7 +400,7 @@ function M.render_cells(snapshot, cols, opts)
         local col = M.context_color(ctx.used_pct)
         push_text(seg, colors.label, spec.ctx_label .. " ")
         push_text(seg, col, format_pct(ctx.used_pct, spec.ctx_decimals))
-        if bar_width > 0 then
+        if spec.show_ctx_bar and bar_width > 0 then
           push_text(seg, nil, " ")
           push_bar(seg, ctx.used_pct, bar_width, col, opts, colors)
         end
@@ -341,7 +419,7 @@ function M.render_cells(snapshot, cols, opts)
   render_quota_segment(segments, spec.weekly_label, snapshot.weekly, bar_width, now, opts, colors)
 
   if #segments == 0 then
-    if opts.hide_when_empty then
+    if hide_when_empty then
       return {}
     end
     add_segment(segments, function(seg)

@@ -138,6 +138,8 @@ local M = {
 local LAYOUT_CYCLE = { "auto", "full", "compact", "minimal" }
 
 local INIT_DEFAULTS = {
+  only_when_agy = true,
+  tab_bar_at_bottom = nil,
   register_status_event = true,
   toggle_layout_key = nil,
   refresh_key = nil,
@@ -343,12 +345,12 @@ function M.get_status_text(window, pane, opts_override, now)
   return wezterm.format(cells)
 end
 
-local function format_short_cwd(pane, max_len)
+local function format_short_cwd(pane, max_len, opts)
   local path = state.get_pane_cwd(pane)
   if path == "" then
     return ""
   end
-  local home = state.expand_home("~", active_opts) or ""
+  local home = state.expand_home("~", opts or active_opts) or ""
   if home ~= "" and path:sub(1, #home) == home then
     path = "~" .. path:sub(#home + 1)
   end
@@ -360,8 +362,9 @@ local function format_short_cwd(pane, max_len)
 end
 
 local function build_standalone_cells(window, pane)
+  local target_pane = resolve_pane(window, pane)
   local opts = resolve_effective_opts(nil, window)
-  local cells = M.get_status_cells(window, pane)
+  local cells = M.get_status_cells(window, target_pane)
   local out = {}
 
   if #cells > 0 then
@@ -373,7 +376,7 @@ local function build_standalone_cells(window, pane)
 
   local show_cwd = opts.append_cwd or opts.show_cwd
   local show_time = opts.append_time or opts.show_time
-  local cwd = show_cwd and format_short_cwd(pane, opts.cwd_max_len) or ""
+  local cwd = show_cwd and format_short_cwd(target_pane, opts.cwd_max_len, opts) or ""
   local has_extra = (cwd ~= "") or show_time
 
   if has_extra and #cells > 0 then
@@ -449,6 +452,9 @@ function M.apply_to_config(config, opts)
   end
 
   if type(config) == "table" then
+    if active_opts.tab_bar_at_bottom ~= nil then
+      config.tab_bar_at_bottom = active_opts.tab_bar_at_bottom
+    end
     local default_mods = active_opts.key_mods or "CTRL|SHIFT"
     bind_optional_key(config, active_opts.toggle_layout_key, default_mods, function(window, pane)
       M.cycle_layout(window)

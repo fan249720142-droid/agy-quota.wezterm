@@ -9,10 +9,11 @@ M.DEFAULTS = {
   plugin_dir = nil,
   cache_read_ttl_secs = 1,
   poll_interval_secs = 30,
-  active_poll_interval_secs = 5,
-  spawn_cooldown_secs = 4,
+  active_poll_interval_secs = 3,
+  spawn_cooldown_secs = 2,
   proc_cache_ttl_secs = 2,
   pane_prune_ttl_secs = 60,
+  only_when_agy = true,
   hide_context_outside_agy = true,
   pool = nil,
   agy_process_names = { "agy", "agy-cli", "antigravity" },
@@ -586,6 +587,13 @@ local function read_pane_cached(cache_dir, pane_id, opts, now, force)
   return data
 end
 
+local function normalize_model_key(str)
+  if type(str) ~= "string" then
+    return ""
+  end
+  return (str:lower():gsub("[^%w]", ""))
+end
+
 local function match_model_pool(model_id, model_pools, pools)
   if type(model_id) ~= "string" or model_id == "" or type(pools) ~= "table" then
     return nil
@@ -596,16 +604,21 @@ local function match_model_pool(model_id, model_pools, pools)
       return exact
     end
     local lower_id = model_id:lower()
+    local norm_id = normalize_model_key(model_id)
     local best_key_len = -1
     local best_pool = nil
     for k, pool_name in pairs(model_pools) do
       if type(k) == "string" and type(pool_name) == "string" and type(pools[pool_name]) == "table" then
         local lk = k:lower()
-        if lk == lower_id then
+        local nk = normalize_model_key(k)
+        if lk == lower_id or (norm_id ~= "" and nk == norm_id) then
           return pool_name
         end
         if lower_id:find(lk, 1, true) and #lk > best_key_len then
           best_key_len = #lk
+          best_pool = pool_name
+        elseif norm_id ~= "" and nk ~= "" and norm_id:find(nk, 1, true) and #nk > best_key_len then
+          best_key_len = #nk
           best_pool = pool_name
         end
       end
@@ -633,7 +646,10 @@ end
 --- Choose the active quota pool using explicit override, pane data, model map, and default pool.
 function M.resolve_pool(quota_data, pane_data, opts)
   if type(quota_data) ~= "table" or type(quota_data.pools) ~= "table" then
-    return nil, nil
+    local fallback_key = (opts and type(opts.pool) == "string" and opts.pool ~= "" and opts.pool)
+      or (type(pane_data) == "table" and type(pane_data.pool) == "string" and pane_data.pool ~= "" and pane_data.pool)
+      or nil
+    return fallback_key, nil
   end
   local pools = quota_data.pools
   local function valid_pool(key)
@@ -648,6 +664,7 @@ function M.resolve_pool(quota_data, pane_data, opts)
   end
   if type(pane_data) == "table" then
     local mapped = match_model_pool(pane_data.model_id, quota_data.model_pools, pools)
+      or match_model_pool(pane_data.model_display_name, quota_data.model_pools, pools)
     if valid_pool(mapped) then
       return mapped, pools[mapped]
     end
@@ -733,7 +750,7 @@ function M.spawn_refresh(pane_id, cwd, opts, now, force)
   opts = opts or M.DEFAULTS
   now = now or os.time()
 
-  local cooldown = force and 0 or math.max(4, opts.spawn_cooldown_secs or 4)
+  local cooldown = force and 0 or math.max(2, opts.spawn_cooldown_secs or 2)
   if (now - runtime_state.last_spawn_at) < cooldown then
     return false
   end
@@ -782,17 +799,30 @@ function M.get_snapshot(pane, opts, now, force)
   local quota_stale = (quota_data == nil) or (quota_ts == nil) or ((now - quota_ts) >= poll_interval)
 
   local pane_ts = pane_data and M.parse_epoch(pane_data.updated_at) or nil
-  local active_interval = opts.active_poll_interval_secs or 5
+  local active_interval = opts.active_poll_interval_secs or 3
   local pane_stale = false
   if is_agy and pane_id ~= nil then
     pane_stale = (pane_data == nil) or (pane_ts == nil) or ((now - pane_ts) >= active_interval)
   end
 
-  if force or quota_stale or pane_stale then
+  local allow_spawn = (force == true) or (is_agy == true) or (opts.only_when_agy == false)
+  if allow_spawn and (force or quota_stale or pane_stale) then
     M.spawn_refresh(pane_id, cwd, opts, now, force)
   end
 
   local pool_key, pool_data = M.resolve_pool(quota_data, pane_data, opts)
+  local pane_pool_label = type(pane_data) == "table"
+    and (pane_data.pool == nil or pane_data.pool == pool_key)
+    and type(pane_data.pool_label) == "string"
+    and pane_data.pool_label ~= ""
+    and pane_data.pool_label
+    or nil
+  local data_pool_label = pool_data
+    and type(pool_data.label) == "string"
+    and pool_data.label ~= ""
+    and pool_data.label
+    or nil
+  local pool_label = pane_pool_label or data_pool_label or pool_key
 
   return {
     now = now,
@@ -809,7 +839,7 @@ function M.get_snapshot(pane, opts, now, force)
     source = quota_data and quota_data.source or nil,
     plan_tier = quota_data and quota_data.plan_tier or nil,
     pool_key = pool_key,
-    pool_label = (pool_data and type(pool_data.label) == "string" and pool_data.label) or pool_key,
+    pool_label = pool_label,
     model_id = pane_data and pane_data.model_id or nil,
     model_display_name = pane_data and pane_data.model_display_name or nil,
     agent_state = pane_data and pane_data.agent_state or nil,
