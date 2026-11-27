@@ -1,6 +1,7 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolveHomeDir } from './cache.mjs';
 
 let sqlitePromise = null;
 
@@ -36,7 +37,7 @@ function openReadOnlyDb(DatabaseSync, dbPath) {
     // Fallback for read-only directories where WAL/SHM cannot be created.
     const msg = String(err?.message || '');
     if (/readonly|unable to open|SHM|WAL/i.test(msg)) {
-      return new DatabaseSync(`file:${encodeURI(dbPath)}?immutable=1`, { readOnly: true });
+      return new DatabaseSync(`${pathToFileURL(path.resolve(dbPath)).href}?immutable=1`, { readOnly: true });
     }
     throw err;
   }
@@ -247,27 +248,35 @@ export function decodeStepMetadataProto(buf) {
   };
 }
 
-export function getCandidateAppDataDirs(explicitDir = null) {
-  if (explicitDir && typeof explicitDir === 'string') {
-    return [path.resolve(explicitDir)];
+export function getCandidateAppDataDirs(explicitDir = null, env = process.env, platform = process.platform) {
+  if (explicitDir && typeof explicitDir === 'string' && explicitDir.trim()) {
+    return [path.resolve(explicitDir.trim())];
   }
+  const safeEnv = env && typeof env === 'object' ? env : {};
   const dirs = [];
   const add = (p) => {
-    if (!p || typeof p !== 'string') return;
-    const resolved = path.resolve(p);
+    if (!p || typeof p !== 'string' || !p.trim()) return;
+    const resolved = path.resolve(p.trim());
     if (!dirs.includes(resolved)) dirs.push(resolved);
   };
-  add(process.env.WEZTERM_AGY_APP_DATA_DIR);
-  add(process.env.ANTIGRAVITY_APP_DATA_DIR);
-  add(path.join(os.homedir(), '.gemini', 'antigravity-cli'));
-  add(path.join(os.homedir(), '.gemini', 'antigravity'));
+  add(safeEnv.WEZTERM_AGY_APP_DATA_DIR);
+  add(safeEnv.ANTIGRAVITY_APP_DATA_DIR);
+  if (safeEnv.WEZTERM_AGY_GEMINI_DIR && safeEnv.WEZTERM_AGY_GEMINI_DIR.trim()) {
+    add(path.join(safeEnv.WEZTERM_AGY_GEMINI_DIR.trim(), 'antigravity-cli'));
+    add(path.join(safeEnv.WEZTERM_AGY_GEMINI_DIR.trim(), 'antigravity'));
+  }
+  const homeDir = resolveHomeDir(safeEnv, platform);
+  add(path.join(homeDir, '.gemini', 'antigravity-cli'));
+  add(path.join(homeDir, '.gemini', 'antigravity'));
   return dirs;
 }
 
 function normalizeFsPath(p) {
   if (!p) return '';
   const resolved = path.resolve(String(p));
-  return resolved.length > 1 ? resolved.replace(/\/+$/, '') : resolved;
+  const root = path.parse(resolved).root;
+  if (resolved === root) return resolved;
+  return resolved.replace(/[\\/]+$/, '');
 }
 
 function parseWorkspaceUris(raw) {
@@ -285,10 +294,15 @@ function parseWorkspaceUris(raw) {
     if (!s) continue;
     if (s.startsWith('file://')) {
       try {
-        paths.push(normalizeFsPath(decodeURIComponent(new URL(s).pathname)));
+        paths.push(normalizeFsPath(fileURLToPath(s)));
         continue;
       } catch {
-        // Fall through.
+        try {
+          paths.push(normalizeFsPath(decodeURIComponent(new URL(s).pathname)));
+          continue;
+        } catch {
+          // Fall through.
+        }
       }
     }
     paths.push(normalizeFsPath(s));
@@ -320,13 +334,18 @@ function getFileMtimeMs(filePath) {
 function scoreWorkspaceMatch(workspacePaths, targetCwd) {
   const normCwd = normalizeFsPath(targetCwd);
   if (!normCwd) return 0;
+  const fold = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  const cmpCwd = fold(normCwd);
+  const cwdRoot = path.parse(cmpCwd).root;
   let best = 0;
   for (const ws of workspacePaths) {
-    if (ws === normCwd) {
+    const cmpWs = fold(ws);
+    const wsRoot = path.parse(cmpWs).root;
+    if (cmpWs === cmpCwd) {
       best = Math.max(best, 10_000 + ws.length);
-    } else if (ws === '/' || normCwd.startsWith(`${ws}/`)) {
+    } else if (cmpWs === wsRoot ? cmpCwd.startsWith(wsRoot) : cmpCwd.startsWith(`${cmpWs}${path.sep}`)) {
       best = Math.max(best, 5_000 + ws.length);
-    } else if (ws.startsWith(`${normCwd}/`)) {
+    } else if (cmpCwd === cwdRoot ? cmpWs.startsWith(cwdRoot) : cmpWs.startsWith(`${cmpCwd}${path.sep}`)) {
       best = Math.max(best, 1_000 + normCwd.length);
     }
   }
@@ -452,9 +471,10 @@ export async function readConversationFromSqlite({
   conversationId = null,
   cwd = null,
   appDataDir = null,
+  env = process.env,
 } = {}) {
   const { DatabaseSync } = await loadSqlite();
-  const dirs = getCandidateAppDataDirs(appDataDir);
+  const dirs = getCandidateAppDataDirs(appDataDir, env);
 
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue;

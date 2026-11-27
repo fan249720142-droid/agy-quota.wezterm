@@ -5,25 +5,69 @@ import path from 'node:path';
 export const DEFAULT_STALE_LOCK_MS = 20_000;
 
 /**
- * Resolve the cache directory for WezTerm Antigravity status files.
+ * Resolve the user's home directory across POSIX (HOME) and Windows (USERPROFILE).
  */
-export function getStatusDir() {
-  const override = process.env.WEZTERM_AGY_STATUS_DIR;
-  if (override && override.trim()) {
-    return path.resolve(override.trim());
+export function resolveHomeDir(env = process.env, platform = process.platform) {
+  const safeEnv = env && typeof env === 'object' ? env : {};
+  if (platform === 'win32') {
+    const winHome = (safeEnv.USERPROFILE && safeEnv.USERPROFILE.trim())
+      || (safeEnv.HOME && safeEnv.HOME.trim())
+      || (safeEnv.HOMEDRIVE && safeEnv.HOMEPATH ? `${safeEnv.HOMEDRIVE}${safeEnv.HOMEPATH}`.trim() : '');
+    if (winHome) return winHome;
+  } else if (safeEnv.HOME && safeEnv.HOME.trim()) {
+    return safeEnv.HOME.trim();
   }
-  const cacheHome = process.env.XDG_CACHE_HOME && process.env.XDG_CACHE_HOME.trim()
-    ? process.env.XDG_CACHE_HOME.trim()
-    : path.join(os.homedir(), '.cache');
-  return path.join(cacheHome, 'wezterm-agy-status');
+  return os.homedir();
 }
 
 /**
- * Normalize a WezTerm pane identifier for safe filename usage.
+ * Resolve the cache directory for WezTerm / Windows Terminal Antigravity status files.
+ */
+export function getStatusDir(env = process.env, platform = process.platform) {
+  const safeEnv = env && typeof env === 'object' ? env : {};
+  const override = safeEnv.WEZTERM_AGY_STATUS_DIR;
+  if (override && override.trim()) {
+    return path.resolve(override.trim());
+  }
+  const xdg = safeEnv.XDG_CACHE_HOME && safeEnv.XDG_CACHE_HOME.trim();
+  if (xdg) {
+    return path.join(xdg, 'wezterm-agy-status');
+  }
+  if (platform === 'win32') {
+    const localAppData = (safeEnv.LOCALAPPDATA && safeEnv.LOCALAPPDATA.trim())
+      || path.join(resolveHomeDir(safeEnv, platform), 'AppData', 'Local');
+    return path.join(localAppData, 'wezterm-agy-status');
+  }
+  return path.join(resolveHomeDir(safeEnv, platform), '.cache', 'wezterm-agy-status');
+}
+
+/**
+ * Normalize a pane/session identifier for safe filename usage.
  */
 export function sanitizePaneId(paneId) {
   const cleaned = String(paneId ?? '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
   return cleaned || 'default';
+}
+
+/**
+ * Resolve the terminal pane/session key with priority:
+ * 1) explicit pane argument
+ * 2) env.WEZTERM_PANE
+ * 3) env.WT_SESSION -> wt_<sanitized_id>
+ * 4) 'default'
+ */
+export function resolvePaneId(explicitPane, env = process.env) {
+  const safeEnv = env && typeof env === 'object' ? env : {};
+  if (explicitPane !== null && explicitPane !== undefined && String(explicitPane).trim() !== '') {
+    return sanitizePaneId(explicitPane);
+  }
+  if (safeEnv.WEZTERM_PANE !== null && safeEnv.WEZTERM_PANE !== undefined && String(safeEnv.WEZTERM_PANE).trim() !== '') {
+    return sanitizePaneId(safeEnv.WEZTERM_PANE);
+  }
+  if (safeEnv.WT_SESSION !== null && safeEnv.WT_SESSION !== undefined && String(safeEnv.WT_SESSION).trim() !== '') {
+    return `wt_${sanitizePaneId(safeEnv.WT_SESSION)}`;
+  }
+  return 'default';
 }
 
 /**

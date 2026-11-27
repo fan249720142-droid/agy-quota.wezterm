@@ -1,7 +1,6 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { readJsonSafe } from './cache.mjs';
+import { readJsonSafe, resolveHomeDir } from './cache.mjs';
 import { getPoolLabel, resolveModelMetadata } from './models.mjs';
 import { toNonNegInt } from './usage.mjs';
 
@@ -64,7 +63,10 @@ export function resolveCliSettingsPath({
   if (geminiBaseDir && typeof geminiBaseDir === 'string' && geminiBaseDir.trim()) {
     return path.join(path.resolve(geminiBaseDir.trim()), 'antigravity-cli', 'settings.json');
   }
-  return path.join(os.homedir(), '.gemini', 'antigravity-cli', 'settings.json');
+  if (env?.WEZTERM_AGY_GEMINI_DIR && env.WEZTERM_AGY_GEMINI_DIR.trim()) {
+    return path.join(path.resolve(env.WEZTERM_AGY_GEMINI_DIR.trim()), 'antigravity-cli', 'settings.json');
+  }
+  return path.join(resolveHomeDir(env), '.gemini', 'antigravity-cli', 'settings.json');
 }
 
 /**
@@ -83,7 +85,10 @@ export function readActiveSettingsModel({
   let localInfo = null;
   if (cwd && typeof cwd === 'string' && cwd.trim()) {
     const localPath = path.join(path.resolve(cwd.trim()), '.gemini', 'settings.json');
-    if (localPath !== globalPath) {
+    const samePath = process.platform === 'win32'
+      ? localPath.toLowerCase() === globalPath.toLowerCase()
+      : localPath === globalPath;
+    if (!samePath) {
       localInfo = readSettingsFileModel(localPath);
     }
   }

@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
-import os from 'node:os';
 import path from 'node:path';
+import { resolveHomeDir } from './cache.mjs';
 
 const SERVICE_PREFIX = '/exa.language_server_pb.LanguageServerService/';
 const PAGE_SIZE = 256;
@@ -155,10 +155,10 @@ export async function fetchGeneratorMetadata(endpoint, cascadeId, timeoutMs = 20
 /**
  * Scan ~/.gemini/antigravity*\/daemon/hub_*.json for daemon LS endpoints.
  */
-export function discoverDaemonHubEndpoints(geminiBaseDir = null) {
-  const base = geminiBaseDir
-    || process.env.WEZTERM_AGY_GEMINI_DIR
-    || path.join(os.homedir(), '.gemini');
+export function discoverDaemonHubEndpoints(geminiBaseDir = null, env = process.env) {
+  const base = (geminiBaseDir && String(geminiBaseDir).trim())
+    || (env?.WEZTERM_AGY_GEMINI_DIR && env.WEZTERM_AGY_GEMINI_DIR.trim())
+    || path.join(resolveHomeDir(env), '.gemini');
   const results = [];
   let entries;
   try {
@@ -264,7 +264,7 @@ export function buildEndpointCandidates({
     add(ep);
   }
 
-  for (const daemonEp of discoverDaemonHubEndpoints(geminiBaseDir)) {
+  for (const daemonEp of discoverDaemonHubEndpoints(geminiBaseDir, env)) {
     add(daemonEp);
   }
 

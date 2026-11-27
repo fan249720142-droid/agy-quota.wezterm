@@ -12,21 +12,21 @@ function resolveRepoPaths() {
   } catch {
     selfPath = fileURLToPath(import.meta.url);
   }
-  const realRepoRoot = path.resolve(path.dirname(selfPath), '../..');
+  const realRepoRoot = path.resolve(path.dirname(selfPath), '..', '..');
   const fallbackRepoRoot = path.join(os.homedir(), 'agy-quota.wezterm');
-  const repoRoot = fs.existsSync(path.join(realRepoRoot, 'bin/lib/hook-handler.mjs'))
+  const repoRoot = fs.existsSync(path.join(realRepoRoot, 'bin', 'lib', 'hook-handler.mjs'))
     ? realRepoRoot
     : fallbackRepoRoot;
 
-  const defaultCollector = path.join(repoRoot, 'bin/agy-status-collector.mjs');
+  const defaultCollector = path.join(repoRoot, 'bin', 'agy-status-collector.mjs');
   const collectorOverride = process.env.WEZTERM_AGY_COLLECTOR_BIN;
   const collectorPath = collectorOverride && fs.existsSync(collectorOverride)
     ? collectorOverride
     : defaultCollector;
 
   return {
-    hookHandlerPath: path.join(repoRoot, 'bin/lib/hook-handler.mjs'),
-    cachePath: path.join(repoRoot, 'bin/lib/cache.mjs'),
+    hookHandlerPath: path.join(repoRoot, 'bin', 'lib', 'hook-handler.mjs'),
+    cachePath: path.join(repoRoot, 'bin', 'lib', 'cache.mjs'),
     collectorPath,
   };
 }
@@ -75,6 +75,7 @@ async function run() {
         detached: true,
         stdio: 'ignore',
         env: process.env,
+        windowsHide: true,
       });
       child.on('error', (err) => debugLog('collector spawn error', err));
       child.unref();

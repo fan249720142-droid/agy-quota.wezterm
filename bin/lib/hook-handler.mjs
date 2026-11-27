@@ -4,7 +4,7 @@ import {
   loadModelLimitsCache,
   loadPane,
   loadQuota,
-  sanitizePaneId,
+  resolvePaneId,
   saveEndpoints,
   savePane,
 } from './cache.mjs';
@@ -82,14 +82,15 @@ function extractHookModel(payload) {
 export function applyHookUpdate({
   hookEvent,
   payload = {},
+  pane = null,
   env = process.env,
-  statusDir = getStatusDir(),
+  statusDir = getStatusDir(env),
   nowMs = Date.now(),
   nowEpoch = Math.floor(nowMs / 1000),
 } = {}) {
   const effectiveNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
   const effectiveNowEpoch = Number.isFinite(nowEpoch) ? nowEpoch : Math.floor(effectiveNowMs / 1000);
-  const paneId = sanitizePaneId(env.WEZTERM_PANE);
+  const paneId = resolvePaneId(pane, env);
   const existingPane = loadPane(statusDir, paneId);
   const endpointsStore = loadEndpoints(statusDir);
   const existingEp = endpointsStore.endpoints[paneId];

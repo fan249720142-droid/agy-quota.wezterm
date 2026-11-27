@@ -13,7 +13,7 @@ import {
   loadQuota,
   readJsonSafe,
   releaseLock,
-  sanitizePaneId,
+  resolvePaneId,
   saveEndpoints,
   saveModelLimitsCache,
   savePane,
@@ -95,7 +95,7 @@ async function acquireLockWithRetry(statusDir, force) {
  * Refresh `quota.json` and `panes/pane_<id>.json` using LS RPC with read-only SQLite fallback.
  */
 export async function runRefresh({
-  statusDir = getStatusDir(),
+  statusDir = null,
   pane = null,
   cwd = null,
   conversationId: explicitConversationId = null,
@@ -107,10 +107,11 @@ export async function runRefresh({
   rpcTimeoutMs = 2000,
   nowMs = Date.now(),
 } = {}) {
-  const paneId = sanitizePaneId(pane ?? env.WEZTERM_PANE);
-  ensureCacheDirs(statusDir);
+  const effectiveStatusDir = statusDir || getStatusDir(env);
+  const paneId = resolvePaneId(pane, env);
+  ensureCacheDirs(effectiveStatusDir);
 
-  const lockDir = await acquireLockWithRetry(statusDir, force);
+  const lockDir = await acquireLockWithRetry(effectiveStatusDir, force);
   if (!lockDir) {
     debugLog(`refresh skipped for pane ${paneId}: lock held`);
     return { ok: true, skipped: true, reason: 'locked', paneId };
@@ -119,10 +120,10 @@ export async function runRefresh({
   try {
     const effectiveNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
     const nowEpoch = Math.floor(effectiveNowMs / 1000);
-    const endpointsStore = loadEndpoints(statusDir);
-    const existingQuota = loadQuota(statusDir);
-    const existingPane = loadPane(statusDir, paneId);
-    const cachedLimits = loadModelLimitsCache(statusDir);
+    const endpointsStore = loadEndpoints(effectiveStatusDir);
+    const existingQuota = loadQuota(effectiveStatusDir);
+    const existingPane = loadPane(effectiveStatusDir, paneId);
+    const cachedLimits = loadModelLimitsCache(effectiveStatusDir);
 
     const candidates = buildEndpointCandidates({
       paneId,
@@ -144,11 +145,11 @@ export async function runRefresh({
         existingQuota,
         nowEpoch,
       });
-      saveQuota(statusDir, quotaPayload);
+      saveQuota(effectiveStatusDir, quotaPayload);
 
       const clientConfigs = lsQuota.userStatusResp?.userStatus?.cascadeModelConfigData?.clientModelConfigs || [];
       modelIndex = buildModelIndex(lsQuota.availableModelsResp, clientConfigs, cachedLimits);
-      saveModelLimitsCache(statusDir, modelIndex);
+      saveModelLimitsCache(effectiveStatusDir, modelIndex);
 
       const activeEp = lsQuota.endpoint;
       if (env.ANTIGRAVITY_LS_ADDRESS) {
@@ -166,7 +167,7 @@ export async function runRefresh({
           updated_at: nowEpoch,
         };
         endpointsStore.latest_key = paneId;
-        saveEndpoints(statusDir, endpointsStore);
+        saveEndpoints(effectiveStatusDir, endpointsStore);
       } else if (
         activeEp.key
         && endpointsStore.endpoints[activeEp.key]
@@ -174,7 +175,7 @@ export async function runRefresh({
       ) {
         endpointsStore.endpoints[activeEp.key].prefer_https = Boolean(activeEp.prefer_https);
         endpointsStore.endpoints[activeEp.key].updated_at = nowEpoch;
-        saveEndpoints(statusDir, endpointsStore);
+        saveEndpoints(effectiveStatusDir, endpointsStore);
       }
     }
 
@@ -224,6 +225,7 @@ export async function runRefresh({
         conversationId,
         cwd: effectiveCwd,
         appDataDir,
+        env,
       });
       if (sqliteData) {
         if (!conversationId && sqliteData.conversation_id) {
@@ -261,7 +263,7 @@ export async function runRefresh({
     }
 
     // Re-read pane state on disk before saving so concurrent hook updates aren't clobbered.
-    const latestOnDisk = loadPane(statusDir, paneId);
+    const latestOnDisk = loadPane(effectiveStatusDir, paneId);
     if (
       latestOnDisk?.conversation_id
       && conversationId
@@ -349,7 +351,7 @@ export async function runRefresh({
       updated_at: nowEpoch,
     };
 
-    savePane(statusDir, paneId, finalPane);
+    savePane(effectiveStatusDir, paneId, finalPane);
     return { ok: true, paneId, quota: quotaPayload, pane: finalPane };
   } catch (err) {
     debugLog('runRefresh failed', err);
@@ -433,8 +435,12 @@ async function main() {
 
 const isEntrypoint = (() => {
   try {
-    return Boolean(process.argv[1])
-      && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+    if (!process.argv[1]) return false;
+    const realArgv = fs.realpathSync(process.argv[1]);
+    const realSelf = fs.realpathSync(fileURLToPath(import.meta.url));
+    return process.platform === 'win32'
+      ? realArgv.toLowerCase() === realSelf.toLowerCase()
+      : realArgv === realSelf;
   } catch {
     return false;
   }

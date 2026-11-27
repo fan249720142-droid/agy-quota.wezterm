@@ -12,13 +12,22 @@ import {
   getEndpointsPath,
   getPanePath,
   getQuotaPath,
+  getStatusDir,
   readJsonSafe,
   releaseLock,
+  resolveHomeDir,
+  resolvePaneId,
 } from '../bin/lib/cache.mjs';
-import { callLsRpc } from '../bin/lib/ls-rpc.mjs';
+import { callLsRpc, discoverDaemonHubEndpoints } from '../bin/lib/ls-rpc.mjs';
 import { applyHookUpdate } from '../bin/lib/hook-handler.mjs';
+import { resolveCliSettingsPath } from '../bin/lib/model-tracking.mjs';
 import { buildQuotaPayload, classifyPoolByKeywords } from '../bin/lib/models.mjs';
-import { decodeGeneratorMetadataProto, loadSqlite, readConversationFromSqlite } from '../bin/lib/sqlite-fallback.mjs';
+import {
+  decodeGeneratorMetadataProto,
+  getCandidateAppDataDirs,
+  loadSqlite,
+  readConversationFromSqlite,
+} from '../bin/lib/sqlite-fallback.mjs';
 import { runDump, runRefresh } from '../bin/agy-status-collector.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -1277,4 +1286,248 @@ test('PreInvocation hook modelName updates hook_model_at and preserves 3p across
   assert.equal(pane21AfterCli.pool_label, 'Claude/GPT');
   assert.equal(pane21AfterCli.model_display_name, 'GPT-OSS 120B (Medium)');
 });
+
+test('resolvePaneId follows priority explicit > WEZTERM_PANE > WT_SESSION (wt_<id>) > default', () => {
+  const fullEnv = {
+    WEZTERM_PANE: '2',
+    WT_SESSION: '9a1b2c3d-4e5f-6789-abcd-ef0123456789',
+  };
+
+  // 1. Explicit pane beats WEZTERM_PANE and WT_SESSION (including numeric '0')
+  assert.equal(resolvePaneId('7', fullEnv), '7');
+  assert.equal(resolvePaneId(0, fullEnv), '0');
+  assert.equal(resolvePaneId('wt_custom/1', fullEnv), 'wt_custom_1');
+
+  // 2. Empty/whitespace explicit pane falls through to WEZTERM_PANE
+  assert.equal(resolvePaneId(null, fullEnv), '2');
+  assert.equal(resolvePaneId('   ', fullEnv), '2');
+
+  // 3. Missing/empty WEZTERM_PANE falls through to WT_SESSION with wt_ prefix (never colliding with numeric WezTerm IDs)
+  assert.equal(
+    resolvePaneId(null, { WT_SESSION: '9a1b2c3d-4e5f-6789-abcd-ef0123456789' }),
+    'wt_9a1b2c3d-4e5f-6789-abcd-ef0123456789'
+  );
+  assert.equal(
+    resolvePaneId(undefined, { WEZTERM_PANE: '  ', WT_SESSION: '{abc-123}' }),
+    'wt__abc-123_'
+  );
+  assert.equal(resolvePaneId(null, { WT_SESSION: '2' }), 'wt_2');
+
+  // 4. Fallback to 'default' when all candidates are absent or whitespace
+  assert.equal(resolvePaneId(null, {}), 'default');
+  assert.equal(resolvePaneId(undefined, { WEZTERM_PANE: '', WT_SESSION: '   ' }), 'default');
+  assert.equal(resolvePaneId(null, null), 'default');
+});
+
+test('Windows Terminal WT_SESSION isolates hook state and refresh from WezTerm numeric panes', async (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const mock = await startMockLsServer(({ method, body }) => {
+    if (method === 'RetrieveUserQuotaSummary') return { body: buildMockQuotaSummaryPayload() };
+    if (method === 'GetUserStatus') return { body: buildMockUserStatusPayload() };
+    if (method === 'GetAvailableModels') return { body: buildMockModelsPayload() };
+    if (method === 'GetCascadeTrajectoryGeneratorMetadata') {
+      if (body.cascadeId === 'conv-wt-1') {
+        return {
+          body: {
+            generatorMetadata: [
+              {
+                stepIndices: [0],
+                chatModel: {
+                  model: 'MODEL_PLACEHOLDER_M402',
+                  modelDisplayName: 'Claude Opus 5.5 (High)',
+                  usage: { inputTokens: '1000', outputTokens: '500', cacheReadTokens: '8500' },
+                },
+              },
+            ],
+          },
+        };
+      }
+      return {
+        body: {
+          generatorMetadata: [
+            {
+              stepIndices: [0],
+              chatModel: {
+                model: 'MODEL_PLACEHOLDER_M528',
+                modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+                usage: { inputTokens: '2000', outputTokens: '500', cacheReadTokens: '7500' },
+              },
+            },
+          ],
+        },
+      };
+    }
+    return { status: 404, body: {} };
+  });
+  t.after(() => mock.close());
+
+  const statusDir = path.join(tmpDir, 'status');
+  const wtSessionA = '11111111-2222-3333-4444-555555555555';
+  const wtSessionNumeric = '2';
+
+  // 1. WezTerm pane 2 hook + refresh
+  const wezHook = applyHookUpdate({
+    hookEvent: 'PreInvocation',
+    payload: { conversationId: 'conv-wez-2', cwd: '/home/xiaolu/wez-proj' },
+    env: {
+      WEZTERM_PANE: '2',
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-wez',
+    },
+    statusDir,
+  });
+  assert.equal(wezHook.paneId, '2');
+
+  const wezRefresh = await runRefresh({
+    statusDir,
+    cwd: '/home/xiaolu/wez-proj',
+    appDataDir: path.join(tmpDir, 'no-sqlite'),
+    geminiBaseDir: path.join(tmpDir, 'no-gemini'),
+    env: {
+      WEZTERM_PANE: '2',
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-wez',
+    },
+  });
+  assert.equal(wezRefresh.ok, true);
+  assert.equal(wezRefresh.paneId, '2');
+  assert.equal(wezRefresh.pane.pool, 'gemini');
+
+  // 2. WT_SESSION='2' must write to pane_wt_2.json and NEVER collide with pane_2.json
+  const wtNumHook = applyHookUpdate({
+    hookEvent: 'PreInvocation',
+    payload: { conversationId: 'conv-wt-1', cwd: '/home/xiaolu/wt-num' },
+    env: {
+      WT_SESSION: wtSessionNumeric,
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-wt-num',
+    },
+    statusDir,
+  });
+  assert.equal(wtNumHook.paneId, 'wt_2');
+
+  const wtNumRefresh = await runRefresh({
+    statusDir,
+    cwd: '/home/xiaolu/wt-num',
+    appDataDir: path.join(tmpDir, 'no-sqlite'),
+    geminiBaseDir: path.join(tmpDir, 'no-gemini'),
+    env: {
+      WT_SESSION: wtSessionNumeric,
+      ANTIGRAVITY_LS_ADDRESS: mock.address,
+      ANTIGRAVITY_CSRF_TOKEN: 'tok-wt-num',
+    },
+  });
+  assert.equal(wtNumRefresh.ok, true);
+  assert.equal(wtNumRefresh.paneId, 'wt_2');
+  assert.equal(wtNumRefresh.pane.pool, '3p');
+  assert.equal(wtNumRefresh.pane.conversation_id, 'conv-wt-1');
+
+  // Verify pane_2.json stayed isolated with Gemini / conv-wez-2
+  const pane2 = readJsonSafe(getPanePath(statusDir, '2'));
+  assert.equal(pane2.pane_id, '2');
+  assert.equal(pane2.conversation_id, 'conv-wez-2');
+  assert.equal(pane2.pool, 'gemini');
+
+  // 3. End-to-end hook-bridge.mjs with WT_SESSION UUID spawns collector with --pane wt_<uuid>
+  const envWtBridge = {
+    ...process.env,
+    WEZTERM_AGY_STATUS_DIR: statusDir,
+    WT_SESSION: wtSessionA,
+    ANTIGRAVITY_LS_ADDRESS: mock.address,
+    ANTIGRAVITY_CSRF_TOKEN: 'tok-wt-uuid',
+  };
+  delete envWtBridge.WEZTERM_PANE;
+  delete envWtBridge.WEZTERM_AGY_COLLECTOR_BIN;
+
+  const hookProc = await runChildAsync(process.execPath, [HOOK_BRIDGE_PATH, 'Stop'], {
+    input: JSON.stringify({ conversationId: 'conv-wt-1', cwd: '/home/xiaolu/wt-uuid', fullyIdle: true }),
+    env: envWtBridge,
+  });
+  assert.equal(hookProc.status, 0);
+  assert.equal(hookProc.stdout, '{}\n');
+
+  const expectedWtKey = `wt_${wtSessionA}`;
+  let wtPane = null;
+  for (let i = 0; i < 40; i++) {
+    const p = readJsonSafe(getPanePath(statusDir, expectedWtKey));
+    if (p?.context?.source === 'ls_rpc') {
+      wtPane = p;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.ok(wtPane, 'hook-bridge + detached collector should populate pane_wt_<uuid>.json');
+  assert.equal(wtPane.pane_id, expectedWtKey);
+  assert.equal(wtPane.pool, '3p');
+  assert.equal(wtPane.agent_state, 'idle');
+
+  const endpoints = readJsonSafe(getEndpointsPath(statusDir));
+  assert.equal(endpoints.endpoints['2'].csrf_token, 'tok-wez');
+  assert.equal(endpoints.endpoints['wt_2'].csrf_token, 'tok-wt-num');
+  assert.equal(endpoints.endpoints[expectedWtKey].csrf_token, 'tok-wt-uuid');
+});
+
+test('Cross-platform path helpers preserve Linux paths and support Windows HOME/USERPROFILE/LOCALAPPDATA', (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  // Linux paths remain identical
+  assert.equal(resolveHomeDir({ HOME: '/home/alice' }, 'linux'), '/home/alice');
+  assert.equal(
+    getStatusDir({ HOME: '/home/alice' }, 'linux'),
+    path.join('/home/alice', '.cache', 'wezterm-agy-status')
+  );
+  assert.equal(
+    getStatusDir({ HOME: '/home/alice', XDG_CACHE_HOME: '/tmp/xdg' }, 'linux'),
+    path.join('/tmp/xdg', 'wezterm-agy-status')
+  );
+  assert.equal(
+    getStatusDir({ WEZTERM_AGY_STATUS_DIR: path.join(tmpDir, 'override') }, 'linux'),
+    path.resolve(path.join(tmpDir, 'override'))
+  );
+
+  // Windows path resolution
+  assert.equal(resolveHomeDir({ USERPROFILE: '/win/users/alice' }, 'win32'), '/win/users/alice');
+  assert.equal(
+    resolveHomeDir({ HOMEDRIVE: 'C:', HOMEPATH: '\\Users\\alice' }, 'win32'),
+    'C:\\Users\\alice'
+  );
+  assert.equal(
+    getStatusDir({ LOCALAPPDATA: '/win/localappdata', USERPROFILE: '/win/users/alice' }, 'win32'),
+    path.join('/win/localappdata', 'wezterm-agy-status')
+  );
+  assert.equal(
+    getStatusDir({ USERPROFILE: '/win/users/alice' }, 'win32'),
+    path.join('/win/users/alice', 'AppData', 'Local', 'wezterm-agy-status')
+  );
+  assert.equal(
+    getStatusDir({ XDG_CACHE_HOME: '/win/xdg', LOCALAPPDATA: '/win/localappdata' }, 'win32'),
+    path.join('/win/xdg', 'wezterm-agy-status')
+  );
+
+  // resolveCliSettingsPath, getCandidateAppDataDirs, and discoverDaemonHubEndpoints respect injected env HOME
+  const fakeHome = path.join(tmpDir, 'fake-home');
+  const daemonDir = path.join(fakeHome, '.gemini', 'antigravity-cli', 'daemon');
+  fs.mkdirSync(daemonDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(daemonDir, 'hub_1.json'),
+    JSON.stringify({ ls_address: '127.0.0.1:50001', csrf_token: 'hub-tok' })
+  );
+
+  const envWithHome = { HOME: fakeHome };
+  assert.equal(
+    resolveCliSettingsPath({ env: envWithHome }),
+    path.join(fakeHome, '.gemini', 'antigravity-cli', 'settings.json')
+  );
+  assert.deepEqual(getCandidateAppDataDirs(null, envWithHome, 'linux'), [
+    path.join(fakeHome, '.gemini', 'antigravity-cli'),
+    path.join(fakeHome, '.gemini', 'antigravity'),
+  ]);
+  const hubs = discoverDaemonHubEndpoints(null, envWithHome);
+  assert.equal(hubs.length, 1);
+  assert.equal(hubs[0].ls_address, '127.0.0.1:50001');
+});
+
 
