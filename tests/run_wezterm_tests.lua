@@ -146,6 +146,15 @@ local function make_mock_window(id, active_pane, tab_cols)
   return win
 end
 
+local function make_mock_bottom_window(id, active_pane, tab_cols)
+  local win = make_mock_window(id, active_pane, tab_cols)
+  win._last_bottom_status = nil
+  function win:set_bottom_status(s)
+    self._last_bottom_status = s
+  end
+  return win
+end
+
 -- Load plugin via dofile and verify require compatibility
 local plugin = dofile(REPO_ROOT .. "/plugin/init.lua")
 local render = plugin.render
@@ -1036,6 +1045,262 @@ test("apply_to_config supports tab_bar_at_bottom option", function()
     register_status_event = false,
   })
   assert_eq(cfg_untouched.tab_bar_at_bottom, false, "leaves tab_bar_at_bottom untouched when nil")
+end)
+
+test("render_bottom_lines and render_bottom_text render 2-line Gemini/3p/compact/empty states", function()
+  local now = 1730000000
+  local function has_fg_color(cells, color)
+    for i = 1, #cells do
+      local item = cells[i]
+      if item.Foreground and item.Foreground.Color == color then
+        return true
+      end
+    end
+    return false
+  end
+
+  local snap_gemini = {
+    now = now,
+    is_agy = true,
+    pool_key = "gemini",
+    pool_label = "Gemini",
+    context = {
+      cached_pct = 99.1,
+      used_pct = 35.9,
+      used_tokens = 376200,
+      context_window_size = 1000000,
+    },
+    five_hour = {
+      remaining_pct = 49,
+      reset_epoch = now + 4860, -- 1h21m
+    },
+    weekly = {
+      remaining_pct = 86,
+      reset_epoch = now + 590400, -- 6d20h
+    },
+  }
+
+  local lines_full = render.render_bottom_lines(snap_gemini, 120, {})
+  assert_eq(
+    render.cells_to_plain_text(lines_full.line1),
+    "Cached 99.1% │ Context 35.9% ████░░░░░░ 376.2k/1.0M",
+    "bottom line 1 full Gemini"
+  )
+  assert_eq(
+    render.cells_to_plain_text(lines_full.line2),
+    "Gemini │ Five Hours 49% █████░░░░░ 1h21m │ Weekly 86% █████████░ 6d20h",
+    "bottom line 2 full Gemini"
+  )
+  assert_true(has_fg_color(lines_full.line2, "#89b4fa"), "bottom Gemini pool uses #89b4fa")
+  assert_true(has_fg_color(lines_full.line2, "#57caff"), "bottom countdown uses #57caff")
+  assert_true(has_fg_color(lines_full.line2, "#3b4052"), "bottom empty bar uses #3b4052")
+
+  local bottom_ansi = render.render_bottom_text(snap_gemini, 120, {})
+  assert_true(bottom_ansi:find("\n", 1, true) ~= nil, "render_bottom_text joins line1 and line2 with newline")
+  assert_true(bottom_ansi:find("Cached ", 1, true) ~= nil and bottom_ansi:find("99%.1%%") ~= nil, "ANSI text has Cached 99.1%")
+  assert_true(bottom_ansi:find("Five Hours ", 1, true) ~= nil and bottom_ansi:find("49%%") ~= nil, "ANSI text has Five Hours 49%")
+
+  -- 3p / Claude & GPT pool
+  local snap_3p = {
+    now = now,
+    is_agy = true,
+    pool_key = "3p",
+    pool_label = "Claude & GPT",
+    context = snap_gemini.context,
+    five_hour = { remaining_pct = 59, reset_epoch = now + 13980 },
+    weekly = { remaining_pct = 71, reset_epoch = now + 350000 },
+  }
+  local lines_3p = render.render_bottom_lines(snap_3p, 105, {})
+  assert_eq(
+    render.cells_to_plain_text(lines_3p.line2),
+    "Claude/GPT │ Five Hours 59% ██████░░░░ 3h53m │ Weekly 71% ███████░░░ 4d1h",
+    "bottom line 2 full 3p"
+  )
+  assert_true(has_fg_color(lines_3p.line2, "#d4bdf5"), "bottom 3p pool uses #d4bdf5")
+
+  -- Compact bottom layout when cols < 85
+  local lines_narrow = render.render_bottom_lines(snap_gemini, 80, {})
+  assert_eq(
+    render.cells_to_plain_text(lines_narrow.line1),
+    "C 99% │ Ctx 36% █░░░ 376k/1.0M",
+    "bottom line 1 compact when cols < 85"
+  )
+  assert_eq(
+    render.cells_to_plain_text(lines_narrow.line2),
+    "Gem │ 5h 49% ██░░ 1h21m │ Wk 86% ███░ 6d20h",
+    "bottom line 2 compact when cols < 85"
+  )
+  local lines_narrow_3p = render.render_bottom_lines(snap_3p, 80, {})
+  assert_eq(
+    render.cells_to_plain_text(lines_narrow_3p.line2),
+    "Cld │ 5h 59% ██░░ 3h53m │ Wk 71% ███░ 4d1h",
+    "bottom line 2 compact 3p when cols < 85"
+  )
+
+  -- Unpopulated context inside agy
+  local snap_no_ctx = {
+    now = now,
+    is_agy = true,
+    pool_key = "gemini",
+    five_hour = snap_gemini.five_hour,
+    weekly = snap_gemini.weekly,
+  }
+  local lines_no_ctx = render.render_bottom_lines(snap_no_ctx, 120, {})
+  assert_eq(
+    render.cells_to_plain_text(lines_no_ctx.line1),
+    "Cached -- │ Context --",
+    "unpopulated context renders Cached -- | Context --"
+  )
+
+  -- Custom bar width/chars & show_pool = false
+  local lines_custom = render.render_bottom_lines(snap_gemini, 120, {
+    show_pool = false,
+    bottom_bar_width = 5,
+    bottom_bar_filled_char = "#",
+    bottom_bar_empty_char = "-",
+  })
+  assert_eq(
+    render.cells_to_plain_text(lines_custom.line1),
+    "Cached 99.1% │ Context 35.9% ##--- 376.2k/1.0M",
+    "custom bottom_bar_width and chars on line 1"
+  )
+  assert_eq(
+    render.cells_to_plain_text(lines_custom.line2),
+    "Five Hours 49% ##--- 1h21m │ Weekly 86% ####- 6d20h",
+    "show_pool=false and custom bar chars on line 2"
+  )
+
+  -- Outside agy (is_agy = false) returns empty tables and ""
+  local snap_shell = {
+    now = now,
+    is_agy = false,
+    pool_key = "gemini",
+    context = snap_gemini.context,
+    five_hour = snap_gemini.five_hour,
+    weekly = snap_gemini.weekly,
+  }
+  local lines_shell = render.render_bottom_lines(snap_shell, 120, {})
+  assert_eq(#lines_shell.line1, 0, "is_agy=false line1 empty")
+  assert_eq(#lines_shell.line2, 0, "is_agy=false line2 empty")
+  assert_eq(render.render_bottom_text(snap_shell, 120, {}), "", "is_agy=false render_bottom_text returns empty string")
+end)
+
+test("feature-detected dual mode routes to set_bottom_status on wezterm-custom and falls back on stock wezterm", function()
+  local tmp_dir = make_temp_dir()
+  local ok, err = pcall(function()
+    state.reset()
+    local real_now = os.time()
+    write_file(
+      tmp_dir .. "/quota.json",
+      string.format(
+        '{"version":1,"fetched_at":%d,"default_pool":"gemini","pools":{"gemini":{"label":"Gemini","five_hour":{"remaining_pct":49,"reset_epoch":%d},"weekly":{"remaining_pct":86,"reset_epoch":%d}}}}',
+        real_now,
+        real_now + 4860,
+        real_now + 590400
+      )
+    )
+    write_file(
+      tmp_dir .. "/panes/pane_21.json",
+      string.format(
+        '{"version":1,"pane_id":21,"pool":"gemini","context":{"used_tokens":376200,"context_window_size":1000000,"used_pct":35.9,"cached_pct":99.1},"updated_at":%d}',
+        real_now
+      )
+    )
+
+    local agy_pane = make_mock_pane({
+      id = 21,
+      cols = 120,
+      cwd = "/home/xiaolu/work",
+      proc_info = { executable = "/home/xiaolu/.local/bin/agy", name = "agy", children = {} },
+    })
+    local bash_pane = make_mock_pane({
+      id = 22,
+      cols = 120,
+      cwd = "/home/xiaolu/work",
+      proc_info = { executable = "/bin/bash", name = "bash", children = {} },
+    })
+
+    local bottom_win = make_mock_bottom_window(301, agy_pane, 120)
+    local stock_win = make_mock_window(302, agy_pane, 120)
+    local throwing_userdata_proxy = setmetatable({}, {
+      __index = function(_, key)
+        error("unknown field: " .. tostring(key))
+      end,
+    })
+
+    assert_eq(plugin.has_bottom_status_api(nil), false, "nil window has no bottom API")
+    assert_eq(plugin.has_bottom_status_api("win"), false, "string has no bottom API")
+    assert_eq(plugin.has_bottom_status_api(stock_win), false, "stock window has no bottom API")
+    assert_eq(plugin.has_bottom_status_api(throwing_userdata_proxy), false, "throwing proxy safely returns false")
+    assert_eq(plugin.has_bottom_status_api(bottom_win), true, "bottom_win detected as supporting set_bottom_status")
+
+    local cfg = wezterm.config_builder()
+    plugin.apply_to_config(cfg, {
+      cache_dir = tmp_dir,
+      append_cwd = true,
+      append_time = true,
+      refresh_key = "r",
+      spawn_fn = function() end,
+    })
+
+    -- prefer_bottom_status = true keeps top-bar get_status_cells empty on bottom_win, unless overridden
+    assert_eq(#plugin.get_status_cells(bottom_win, agy_pane, nil, real_now), 0, "get_status_cells empty when prefer_bottom_status=true on bottom_win")
+    assert_true(
+      #plugin.get_status_cells(bottom_win, agy_pane, { prefer_bottom_status = false }, real_now) > 0,
+      "prefer_bottom_status=false overrides to top cells"
+    )
+    assert_true(
+      #plugin.get_status_cells(bottom_win, agy_pane, { render_mode = "top" }, real_now) > 0,
+      "render_mode='top' overrides to top cells"
+    )
+    assert_true(
+      #plugin.get_status_cells(stock_win, agy_pane, nil, real_now) > 0,
+      "stock_win returns single-line top cells"
+    )
+
+    -- update_bottom_status returns true on bottom_win, false on stock_win
+    assert_eq(plugin.update_bottom_status(stock_win, agy_pane, nil, real_now), false, "update_bottom_status returns false on stock_win")
+    assert_eq(plugin.update_bottom_status(bottom_win, agy_pane, nil, real_now), true, "update_bottom_status returns true on bottom_win")
+    assert_true(type(bottom_win._last_bottom_status) == "string" and bottom_win._last_bottom_status:find("\n", 1, true) ~= nil, "bottom_win received 2-line status")
+
+    -- get_bottom_status_text on agy vs bash pane
+    local bottom_text_agy = plugin.get_bottom_status_text(bottom_win, agy_pane, nil, real_now)
+    assert_true(bottom_text_agy:find("Cached ", 1, true) ~= nil and bottom_text_agy:find("99%.1%%") ~= nil, "get_bottom_status_text includes Cached 99.1%")
+    assert_eq(plugin.get_bottom_status_text(bottom_win, bash_pane, nil, real_now), "", "get_bottom_status_text empty on bash pane")
+
+    -- update-status on bottom_win: 2-line bottom bar + ONLY cwd/time in right status
+    wezterm.emit("update-status", bottom_win, agy_pane)
+    assert_true(bottom_win._last_bottom_status:find("Cached ", 1, true) ~= nil and bottom_win._last_bottom_status:find("99%.1%%") ~= nil, "bottom status contains line 1")
+    assert_true(bottom_win._last_bottom_status:find("Gemini", 1, true) ~= nil, "bottom status contains line 2")
+    assert_true(bottom_win._last_right_status:find("~/work", 1, true) ~= nil, "right status still has cwd")
+    assert_true(bottom_win._last_right_status:find("Gemini", 1, true) == nil, "right status omits quota when bottom bar active")
+    assert_true(bottom_win._last_right_status:find("│", 1, true) == nil, "right status omits leading separator")
+
+    -- update-status on bash pane clears bottom status to ""
+    wezterm.emit("update-status", bottom_win, bash_pane)
+    assert_eq(bottom_win._last_bottom_status, "", "bash pane clears bottom status to empty string")
+    assert_true(bottom_win._last_right_status:find("~/work", 1, true) ~= nil, "right status still renders cwd on bash pane")
+
+    -- update-status on bottom_win without append_cwd/append_time sets right status to ""
+    plugin.setup({
+      cache_dir = tmp_dir,
+      append_cwd = false,
+      append_time = false,
+      spawn_fn = function() end,
+    })
+    wezterm.emit("update-status", bottom_win, agy_pane)
+    assert_eq(bottom_win._last_right_status, "", "right status cleared when no cwd/time and bottom bar active")
+    assert_true(bottom_win._last_bottom_status:find("Five Hours ", 1, true) ~= nil, "bottom status populated")
+
+    -- update-status on stock_win falls back to single-line right status (120 cols -> compact single-line)
+    wezterm.emit("update-status", stock_win, agy_pane)
+    assert_true(stock_win._last_right_status:find("Gemini", 1, true) ~= nil, "stock_win falls back to single-line right status")
+    assert_true(stock_win._last_right_status:find("5h ", 1, true) ~= nil and stock_win._last_right_status:find("49%%") ~= nil, "stock_win right status includes 5h 49%")
+  end)
+  remove_dir(tmp_dir)
+  if not ok then
+    error(err)
+  end
 end)
 
 if failed > 0 then

@@ -139,6 +139,8 @@ local LAYOUT_CYCLE = { "auto", "full", "compact", "minimal" }
 
 local INIT_DEFAULTS = {
   only_when_agy = true,
+  prefer_bottom_status = true,
+  render_mode = "auto",
   tab_bar_at_bottom = nil,
   register_status_event = true,
   toggle_layout_key = nil,
@@ -328,10 +330,45 @@ function M.trigger_refresh(pane, opts_override, now)
   return state.trigger_refresh(pane, opts, now)
 end
 
---- Composable status cells (`FormatItem[]`) for `window` / `pane`.
-function M.get_status_cells(window, pane, opts_override, now)
+--- Feature-detect `wezterm-custom` bottom status bar API on `window`.
+function M.has_bottom_status_api(window)
+  local wtype = type(window)
+  if wtype ~= "table" and wtype ~= "userdata" then
+    return false
+  end
+  local ok, fn = pcall(function()
+    return window.set_bottom_status
+  end)
+  return ok and type(fn) == "function"
+end
+
+--- Build 2-line ANSI bottom status string for `window` / `pane` (or `""` outside `agy`).
+function M.get_bottom_status_text(window, pane, opts_override, now)
   local target_pane = resolve_pane(window, pane)
   local opts = resolve_effective_opts(opts_override, window)
+  local cols = resolve_pane_cols(window, target_pane, opts)
+  local snapshot = state.get_snapshot(target_pane, opts, now)
+  return render.render_bottom_text(snapshot, cols, opts)
+end
+
+--- Update `window:set_bottom_status(...)` when supported; returns `true` if updated, `false` otherwise.
+function M.update_bottom_status(window, pane, opts_override, now)
+  if not M.has_bottom_status_api(window) then
+    return false
+  end
+  local text = M.get_bottom_status_text(window, pane, opts_override, now)
+  window:set_bottom_status(text)
+  return true
+end
+
+--- Composable status cells (`FormatItem[]`) for `window` / `pane`.
+function M.get_status_cells(window, pane, opts_override, now)
+  local opts = resolve_effective_opts(opts_override, window)
+  local force_top = (opts.prefer_bottom_status == false) or (opts.render_mode == "top")
+  if not force_top and M.has_bottom_status_api(window) then
+    return {}
+  end
+  local target_pane = resolve_pane(window, pane)
   local cols = resolve_pane_cols(window, target_pane, opts)
   local snapshot = state.get_snapshot(target_pane, opts, now)
   return render.render_cells(snapshot, cols, opts)
@@ -361,25 +398,13 @@ local function format_short_cwd(pane, max_len, opts)
   return path
 end
 
-local function build_standalone_cells(window, pane)
-  local target_pane = resolve_pane(window, pane)
-  local opts = resolve_effective_opts(nil, window)
-  local cells = M.get_status_cells(window, target_pane)
-  local out = {}
-
-  if #cells > 0 then
-    table.insert(out, { Text = " " })
-    for _, item in ipairs(cells) do
-      table.insert(out, item)
-    end
-  end
-
+local function append_extra_cells(out, target_pane, opts, has_quota_cells)
   local show_cwd = opts.append_cwd or opts.show_cwd
   local show_time = opts.append_time or opts.show_time
   local cwd = show_cwd and format_short_cwd(target_pane, opts.cwd_max_len, opts) or ""
   local has_extra = (cwd ~= "") or show_time
 
-  if has_extra and #cells > 0 then
+  if has_extra and has_quota_cells then
     local colors = opts.colors or render.DEFAULTS.colors
     table.insert(out, { Foreground = { Color = colors.separator or "#4e5568" } })
     table.insert(out, { Text = opts.separator or " │ " })
@@ -404,16 +429,46 @@ local function build_standalone_cells(window, pane)
   if #out > 0 then
     table.insert(out, { Text = " " })
   end
+end
+
+local function build_standalone_cells(window, pane)
+  local target_pane = resolve_pane(window, pane)
+  local opts = resolve_effective_opts(nil, window)
+  local cells = M.get_status_cells(window, target_pane)
+  local out = {}
+
+  if #cells > 0 then
+    table.insert(out, { Text = " " })
+    for _, item in ipairs(cells) do
+      table.insert(out, item)
+    end
+  end
+
+  append_extra_cells(out, target_pane, opts, #cells > 0)
   return out
 end
 
-local function update_status_handler(window, pane)
-  local cells = build_standalone_cells(window, pane)
+local function set_right_status_cells(window, cells)
   if #cells == 0 then
     window:set_right_status("")
   else
     window:set_right_status(wezterm.format(cells))
   end
+end
+
+local function update_status_handler(window, pane)
+  local target_pane = resolve_pane(window, pane)
+  local opts = resolve_effective_opts(nil, window)
+  local use_bottom = (opts.prefer_bottom_status ~= false) and (opts.render_mode ~= "top")
+  if use_bottom and M.update_bottom_status(window, target_pane) then
+    local out = {}
+    append_extra_cells(out, target_pane, opts, false)
+    set_right_status_cells(window, out)
+    return
+  end
+
+  local cells = build_standalone_cells(window, target_pane)
+  set_right_status_cells(window, cells)
 end
 
 local function bind_optional_key(config, key_spec, default_mods, callback)

@@ -1,3 +1,8 @@
+local ok_wezterm, wezterm = pcall(require, "wezterm")
+if not ok_wezterm then
+  wezterm = nil
+end
+
 local M = {}
 
 M.DEFAULTS = {
@@ -10,6 +15,11 @@ M.DEFAULTS = {
   full_bar_width = 8,
   compact_bar_width = 4,
   minimal_bar_width = 4,
+  bottom_bar_width = 10,
+  bottom_compact_bar_width = 4,
+  bottom_compact_cols = 85,
+  bottom_bar_filled_char = "█",
+  bottom_bar_empty_char = "░",
   bar_filled_char = "█",
   bar_empty_char = "░",
   separator = " │ ",
@@ -333,16 +343,80 @@ local function render_quota_segment(segments, label, win, bar_width, now, opts, 
   end)
 end
 
+local function resolve_bool_opt(opts, key, default_val)
+  local val = opts and opts[key]
+  if val == nil then
+    return default_val
+  end
+  return val ~= false
+end
+
+local function should_show_context(snapshot, opts)
+  local hide_outside = resolve_bool_opt(opts, "hide_context_outside_agy", M.DEFAULTS.hide_context_outside_agy)
+  if opts and opts.show_context_outside_agy ~= nil then
+    hide_outside = not opts.show_context_outside_agy
+  end
+  return (snapshot.is_agy == true) or (not hide_outside)
+end
+
+local function add_quota_placeholders(segments, five_hour_label, weekly_label, colors)
+  add_segment(segments, function(seg)
+    push_text(seg, colors.label, five_hour_label .. " ")
+    push_text(seg, colors.muted, "--")
+  end)
+  add_segment(segments, function(seg)
+    push_text(seg, colors.label, weekly_label .. " ")
+    push_text(seg, colors.muted, "--")
+  end)
+end
+
+local function join_segments(segments, sep, sep_color)
+  local cells = {}
+  for idx, seg in ipairs(segments) do
+    if idx > 1 then
+      push_text(cells, sep_color, sep)
+    end
+    for _, item in ipairs(seg) do
+      table.insert(cells, item)
+    end
+  end
+  return cells
+end
+
+local function add_context_segments(segments, ctx, cfg, bar_width, bar_opts, colors)
+  if cfg.show_cache and ctx.cached_pct ~= nil then
+    add_segment(segments, function(seg)
+      push_text(seg, colors.label, cfg.cache_label .. " ")
+      push_text(seg, M.cached_color(ctx.cached_pct), format_pct(ctx.cached_pct, cfg.cache_decimals))
+    end)
+  end
+
+  if ctx.used_pct ~= nil then
+    add_segment(segments, function(seg)
+      local col = M.context_color(ctx.used_pct)
+      push_text(seg, colors.label, cfg.ctx_label .. " ")
+      push_text(seg, col, format_pct(ctx.used_pct, cfg.ctx_decimals))
+      if cfg.show_ctx_bar and bar_width > 0 then
+        push_text(seg, nil, " ")
+        push_bar(seg, ctx.used_pct, bar_width, col, bar_opts, colors)
+      end
+      if cfg.show_tokens and ctx.used_tokens ~= nil and ctx.context_window_size ~= nil then
+        local used_s = M.format_tokens(ctx.used_tokens, cfg.token_mode)
+        local total_s = M.format_tokens(ctx.context_window_size, cfg.token_mode)
+        if used_s and total_s then
+          push_text(seg, colors.tokens, " " .. used_s .. "/" .. total_s)
+        end
+      end
+    end)
+  end
+end
+
 --- Render WezTerm FormatItem cells for `snapshot` at pane width `cols`.
 function M.render_cells(snapshot, cols, opts)
   opts = opts or M.DEFAULTS
   snapshot = snapshot or {}
 
-  local only_when_agy = opts.only_when_agy
-  if only_when_agy == nil then
-    only_when_agy = M.DEFAULTS.only_when_agy
-  end
-  if only_when_agy ~= false and snapshot.is_agy ~= true then
+  if resolve_bool_opt(opts, "only_when_agy", M.DEFAULTS.only_when_agy) and snapshot.is_agy ~= true then
     return {}
   end
 
@@ -356,25 +430,9 @@ function M.render_cells(snapshot, cols, opts)
     bar_width = math.max(0, math.floor(opts[spec.bar_width_key]))
   end
 
-  local hide_outside = opts.hide_context_outside_agy
-  if hide_outside == nil then
-    hide_outside = M.DEFAULTS.hide_context_outside_agy
-  end
-  if opts.show_context_outside_agy ~= nil then
-    hide_outside = not opts.show_context_outside_agy
-  end
-
-  local show_pool = opts.show_pool
-  if show_pool == nil then
-    show_pool = M.DEFAULTS.show_pool
-  end
-
-  local hide_when_empty = opts.hide_when_empty
-  if hide_when_empty == nil then
-    hide_when_empty = M.DEFAULTS.hide_when_empty
-  end
-
-  local show_context = (snapshot.is_agy == true) or (not hide_outside)
+  local show_pool = resolve_bool_opt(opts, "show_pool", M.DEFAULTS.show_pool)
+  local hide_when_empty = resolve_bool_opt(opts, "hide_when_empty", M.DEFAULTS.hide_when_empty)
+  local show_context = should_show_context(snapshot, opts)
   local ctx = snapshot.context
   local segments = {}
 
@@ -388,31 +446,7 @@ function M.render_cells(snapshot, cols, opts)
   end
 
   if show_context and type(ctx) == "table" then
-    if spec.show_cache and ctx.cached_pct ~= nil then
-      add_segment(segments, function(seg)
-        push_text(seg, colors.label, spec.cache_label .. " ")
-        push_text(seg, M.cached_color(ctx.cached_pct), format_pct(ctx.cached_pct, spec.cache_decimals))
-      end)
-    end
-
-    if ctx.used_pct ~= nil then
-      add_segment(segments, function(seg)
-        local col = M.context_color(ctx.used_pct)
-        push_text(seg, colors.label, spec.ctx_label .. " ")
-        push_text(seg, col, format_pct(ctx.used_pct, spec.ctx_decimals))
-        if spec.show_ctx_bar and bar_width > 0 then
-          push_text(seg, nil, " ")
-          push_bar(seg, ctx.used_pct, bar_width, col, opts, colors)
-        end
-        if spec.show_tokens and ctx.used_tokens ~= nil and ctx.context_window_size ~= nil then
-          local used_s = M.format_tokens(ctx.used_tokens, spec.token_mode)
-          local total_s = M.format_tokens(ctx.context_window_size, spec.token_mode)
-          if used_s and total_s then
-            push_text(seg, colors.tokens, " " .. used_s .. "/" .. total_s)
-          end
-        end
-      end)
-    end
+    add_context_segments(segments, ctx, spec, bar_width, opts, colors)
   end
 
   render_quota_segment(segments, spec.five_hour_label, snapshot.five_hour, bar_width, now, opts, colors)
@@ -422,27 +456,143 @@ function M.render_cells(snapshot, cols, opts)
     if hide_when_empty then
       return {}
     end
-    add_segment(segments, function(seg)
-      push_text(seg, colors.label, spec.five_hour_label .. " ")
-      push_text(seg, colors.muted, "--")
-    end)
-    add_segment(segments, function(seg)
-      push_text(seg, colors.label, spec.weekly_label .. " ")
-      push_text(seg, colors.muted, "--")
-    end)
+    add_quota_placeholders(segments, spec.five_hour_label, spec.weekly_label, colors)
   end
 
   local sep = opts.separator or M.DEFAULTS.separator
-  local cells = {}
-  for idx, seg in ipairs(segments) do
-    if idx > 1 then
-      push_text(cells, colors.separator, sep)
-    end
-    for _, item in ipairs(seg) do
-      table.insert(cells, item)
+  return join_segments(segments, sep, colors.separator)
+end
+
+--- Render two-line FormatItem arrays (`{ line1 = ..., line2 = ... }`) for `window:set_bottom_status`.
+function M.render_bottom_lines(snapshot, cols, opts)
+  opts = opts or M.DEFAULTS
+  snapshot = snapshot or {}
+
+  if resolve_bool_opt(opts, "only_when_agy", M.DEFAULTS.only_when_agy) and snapshot.is_agy ~= true then
+    return { line1 = {}, line2 = {} }
+  end
+
+  local colors = resolve_colors(opts)
+  local now = snapshot.now or os.time()
+  local raw_cols = type(cols) == "number" and cols or (opts.default_cols or M.DEFAULTS.default_cols)
+  local effective = raw_cols - (opts.cols_offset or 0)
+  local compact_below = opts.bottom_compact_cols or M.DEFAULTS.bottom_compact_cols
+  local is_compact
+  if opts.layout == "compact" or opts.layout == "minimal" then
+    is_compact = true
+  elseif opts.layout == "full" then
+    is_compact = false
+  else
+    is_compact = effective < compact_below
+  end
+
+  local bar_width
+  if is_compact then
+    bar_width = type(opts.bottom_compact_bar_width) == "number"
+      and math.max(0, math.floor(opts.bottom_compact_bar_width))
+      or M.DEFAULTS.bottom_compact_bar_width
+  else
+    bar_width = type(opts.bottom_bar_width) == "number"
+      and math.max(0, math.floor(opts.bottom_bar_width))
+      or M.DEFAULTS.bottom_bar_width
+  end
+
+  local bar_opts = {
+    bar_filled_char = opts.bottom_bar_filled_char or opts.bar_filled_char or M.DEFAULTS.bottom_bar_filled_char,
+    bar_empty_char = opts.bottom_bar_empty_char or opts.bar_empty_char or M.DEFAULTS.bottom_bar_empty_char,
+  }
+
+  local show_pool = resolve_bool_opt(opts, "show_pool", M.DEFAULTS.show_pool)
+  local hide_when_empty = resolve_bool_opt(opts, "hide_when_empty", M.DEFAULTS.hide_when_empty)
+  local show_context = should_show_context(snapshot, opts)
+
+  local cfg = is_compact and {
+    show_cache = true,
+    cache_label = "C",
+    cache_decimals = 0,
+    ctx_label = "Ctx",
+    ctx_decimals = 0,
+    show_ctx_bar = true,
+    show_tokens = true,
+    token_mode = "compact",
+  } or {
+    show_cache = true,
+    cache_label = "Cached",
+    cache_decimals = 1,
+    ctx_label = "Context",
+    ctx_decimals = 1,
+    show_ctx_bar = true,
+    show_tokens = true,
+    token_mode = "full",
+  }
+  local five_hour_label = is_compact and "5h" or "Five Hours"
+  local weekly_label = is_compact and "Wk" or "Weekly"
+  local pool_mode = is_compact and "minimal" or "full"
+
+  local line1_segments = {}
+  local ctx = snapshot.context
+  if show_context then
+    local has_ctx = type(ctx) == "table" and (ctx.cached_pct ~= nil or ctx.used_pct ~= nil)
+    if has_ctx then
+      add_context_segments(line1_segments, ctx, cfg, bar_width, bar_opts, colors)
+    elseif not hide_when_empty then
+      add_segment(line1_segments, function(seg)
+        push_text(seg, colors.label, cfg.cache_label .. " ")
+        push_text(seg, colors.muted, "--")
+      end)
+      add_segment(line1_segments, function(seg)
+        push_text(seg, colors.label, cfg.ctx_label .. " ")
+        push_text(seg, colors.muted, "--")
+      end)
     end
   end
-  return cells
+
+  local line2_segments = {}
+  local has_pool = false
+  if show_pool then
+    local pool_text, pool_color = resolve_pool_presentation(snapshot, pool_mode, colors)
+    if pool_text then
+      has_pool = true
+      add_segment(line2_segments, function(seg)
+        push_text(seg, pool_color, pool_text)
+      end)
+    end
+  end
+
+  local before_quotas = #line2_segments
+  render_quota_segment(line2_segments, five_hour_label, snapshot.five_hour, bar_width, now, bar_opts, colors)
+  render_quota_segment(line2_segments, weekly_label, snapshot.weekly, bar_width, now, bar_opts, colors)
+
+  if #line2_segments == before_quotas and not hide_when_empty then
+    if not has_pool or snapshot.is_agy == true then
+      add_quota_placeholders(line2_segments, five_hour_label, weekly_label, colors)
+    end
+  end
+
+  local sep = opts.separator or M.DEFAULTS.separator
+  return {
+    line1 = join_segments(line1_segments, sep, colors.separator),
+    line2 = join_segments(line2_segments, sep, colors.separator),
+  }
+end
+
+local function format_items(cells)
+  if #cells == 0 then
+    return ""
+  end
+  if wezterm and type(wezterm.format) == "function" then
+    return wezterm.format(cells)
+  end
+  return M.cells_to_plain_text(cells)
+end
+
+--- Render two-line ANSI string for `window:set_bottom_status`, or `""` when empty.
+function M.render_bottom_text(snapshot, cols, opts)
+  local lines = M.render_bottom_lines(snapshot, cols, opts)
+  if #lines.line1 == 0 and #lines.line2 == 0 then
+    return ""
+  end
+  return format_items(lines.line1) .. "\n" .. format_items(lines.line2)
 end
 
 function M.cells_to_plain_text(cells)
