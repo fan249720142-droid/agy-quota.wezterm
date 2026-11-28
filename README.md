@@ -7,11 +7,13 @@
 ## 核心特性
 
 - **双项目拆分与原生底部双行栏 (`wezterm-custom`)**：`wezterm-custom` 负责渲染 `config.bottom_status_rows = 2` 底部独立状态槽位及 `window:set_bottom_status(ansi_text)`；插件通过 `has_bottom_status_api(window)` 自动识别，有该 API 时保留顶部标签栏 (`tab_bar_at_bottom = false`) 与右上角集成按钮，将双行指标渲染至底部，不在顶部重复堆叠配额。
+- **静默 `statusLine` 遥测泵 (`agy-statusline-feeder.mjs`) + 死端点自愈**：通过 `settings.json` 中 `stack_with_default: true` 且 `stdout` 保持静默的轻量遥测泵，直接承接 `agy` 官方实时推送的 `meta.quota`、`meta.context_window`（含 `cache_creation_input_tokens` 与流式防归零）、`meta.model` 与当前活进程的 LS 凭证；在切换 PID 或遇到 `ECONNREFUSED` / `401` 时主动清理过期端点，并以退避间隔 (`failed_poll_backoff_secs`) 避免后台空转。
+- **四层有效上下文软上限 (`context_limit_mode = "effective"`)**：默认按 Antigravity CLI 实际自动压缩软上限（原生字段 → `AGY_TOKEN_CEILING` / settings 覆写 → 运行时 `maxContextTokens` → `GetAvailableModels` `CASCADE_USE_EXPERIMENT_CHECKPOINTER` 的 `max_token_limit` → `256k → 512k → 物理上限` 步进自愈）计算上下文占比与进度条，也可随时在 WezTerm 配置中切回 `context_limit_mode = "physical"`。
+- **80 级 1/8 亚像素进度条 + 过期配额宽限期归位**：默认使用 `▏▎▍▌▋▊▉█` + 暗色底槽 (`bar_track = "#2b303c"`) 并在条末自动恢复透明背景，在 10 格宽实现 80 级平滑填充（亦可通过 `bar_style = "block"` 切回经典 `█`/`░`）；配额桶支持跨窗口防抖合并、Argon/`-wtu` 过滤、唯一 `reset_time` 交叉归池以及重置超过 `expired_reset_grace_secs`（默认 60s）自动归位。
 - **原版 WezTerm 优雅降级**：若运行在未打补丁的原版 WezTerm（无 `window.set_bottom_status`），`agy_quota.update_bottom_status(...)` 返回 `false`，自动回退到单行 `get_status_cells(...)` + `window:set_right_status(...)`（可按需设 `tab_bar_at_bottom = true` 或留在右上角）。
 - **`agy` 专属可见性 (`only_when_agy = true`)**：仅当当前焦点 Pane 前台进程（或其子进程树）为 `agy` / `agy-cli` / `antigravity` 时显示状态并触发刷新；在普通 Shell Pane 中底部状态返回 `""`（透明不占位），顶部状态栏保持干净的 `cwd` + 时钟（也可设 `only_when_agy = false` 在所有 Pane 显示全局配额）。
-- **动态模型感知切池 (`Gemini` ↔ `Claude/GPT`)**：实时跟踪用户在 CLI 中通过 `/model`、`--model` 参数或会话切换产生的模型变更——综合读取 `settings.json`（只读 `model` 字段并补偿 Linux `mtime` 滞后）、Antigravity Hooks 与 LS RPC 轨迹元数据时间戳，自动在 `Gemini` (`gemini`) 与 `Claude/GPT` (`3p`) 两个配额池之间切换显示对应百分比与倒计时。
-- **跨终端会话键设计**：采集器与 Hook 桥接层 (`bin/lib/cache.mjs` `resolvePaneId`) 按 `显式 --pane` → `WEZTERM_PANE` → `WT_SESSION` (`wt_<id>`) → `default` 解析会话键，为后续扩展至 Windows Terminal 等终端复用同一套采集与缓存机制预留兼容层。
-- **零阻塞纯异步架构**：WezTerm 渲染主线程仅节流读取本地缓存 JSON（1s TTL）并在超时时后台派生 `node` 采集器，不阻塞终端渲染。
+- **动态模型感知切池 (`Gemini` ↔ `Claude/GPT`)**：实时跟踪用户在 CLI 中通过 `/model`、`--model` 参数或会话切换产生的模型变更——综合 `statusLine` 实时模型、只读 `settings.json`、`agy-plugin` Hooks 与增量游标 LS RPC 轨迹元数据，自动在 `Gemini` (`gemini`) 与 `Claude/GPT` (`3p`) 两个配额池之间切换显示对应百分比与倒计时。
+- **跨终端会话键设计 & 零阻塞纯异步架构**：采集器与桥接层按 `显式 --pane` → `WEZTERM_PANE` → `WT_SESSION` (`wt_<id>`) → `default` 解析会话键；WezTerm 渲染主线程仅节流读取本地缓存 JSON（1s TTL），不阻塞终端渲染。
 
 ---
 
@@ -35,27 +37,29 @@
 
 ---
 
-## 共存架构与动态切池（Hooks + Settings + LS RPC + SQLite）
+## 共存架构与动态切池（Silent statusLine Feeder + Hooks + LS RPC + SQLite）
 
-本插件**永不修改 `~/.gemini/antigravity-cli/settings.json`**（原生 `statusLine` 完全不被触碰或覆盖），通过外部插件、独立缓存目录与跨终端会话键（`WEZTERM_PANE` → `WT_SESSION` → `default`）实现无冲突协同，并在 `agy` 运行期间实时跟踪 `/model` 切换：
+通过 `statusLine` 静默遥测泵（`stack_with_default: true` 且 `stdout` 为空，保留 `agy` 原生单行状态栏不占位）+ 外部插件 Hooks + 独立缓存目录 + 跨终端会话键（`WEZTERM_PANE` → `WT_SESSION` → `default`）实现零侵入实时同步（亦可通过 `./install.sh --no-statusline` 保持 `settings.json` 完全不改动）：
 
 ```text
 agy CLI 环境
-  ├─▶ 1. agy-plugin Hooks (SessionStart / PreInvocation / PostInvocation / PostToolUse / Stop)
-  │        └─▶ hook-bridge.mjs ──▶ 按 resolvePaneId(WEZTERM_PANE / WT_SESSION / default) 记录会话与 LS 端点 (0600)
-  ├─▶ 2. 只读 Settings 监控 (model-tracking.mjs)
-  │        └─▶ 仅读取 settings.json 的 `model` 字段 + mtime 滞后补偿（支持 /model 即时切池）
-  └─▶ 3. bin/agy-status-collector.mjs (--refresh)
+  ├─▶ 1. 静默 statusLine 遥测泵 (bin/agy-statusline-feeder.mjs, stdout 为空)
+  │        └─▶ 实时接收 meta.quota / meta.context_window / meta.model + 活 LS 凭证 (0600)
+  ├─▶ 2. agy-plugin Hooks (SessionStart / PreInvocation / PostInvocation / PostToolUse / Stop)
+  │        └─▶ hook-bridge.mjs ──▶ 补充生命周期状态与按 Pane 隔离的会话元信息
+  ├─▶ 3. 只读 Settings 监控 (model-tracking.mjs)
+  │        └─▶ 读取 settings.json 的 `model` 字段 + mtime 滞后补偿（支持 /model 即时切池）
+  └─▶ 4. bin/agy-status-collector.mjs (--refresh)
            ├─▶ Official LS Connect-JSON RPC (/exa.language_server_pb.LanguageServerService/)
-           │     ├─ RetrieveUserQuotaSummary / GetUserStatus / GetAvailableModels ──▶ quota.json (gemini + 3p 池)
-           │     └─ GetCascadeTrajectoryGeneratorMetadata ──▶ 步数递增时更新 RPC 模型与 usage (ls_rpc)
+           │     ├─ RetrieveUserQuotaSummary / GetUserStatus / GetAvailableModels ──▶ quota.json + model_limits.json (含软压缩上限)
+           │     └─ GetCascadeTrajectoryGeneratorMetadata (includeMessages: false + 增量游标) ──▶ runtime maxContextTokens & usage
            └─▶ Read-only SQLite Fallback (node:sqlite)
                  └─ 读取 ~/.gemini/antigravity-cli/conversation_summaries.db 解析 protobuf (sqlite)
                                  │
-                                 ▼ (时间戳裁决 hook > rpc > settings)
+                                 ▼ (时间戳裁决 hook > rpc > settings + 4 层有效压缩上限)
 WezTerm Lua (plugin/init.lua + state.lua + render.lua)
-  └─▶ 检测前景进程 (agy 时才渲染) ──▶ 节流读缓存 (1s) / 后台刷新
-        ├─▶ wezterm-custom (存在 set_bottom_status) ──▶ window:set_bottom_status(双行 ANSI) + 顶部仅 cwd/时钟
+  └─▶ 检测前景进程 (agy 时才渲染) ──▶ 节流读缓存 (1s) / 失败退避 (15s) / 过期宽限期归位 (60s)
+        ├─▶ wezterm-custom (存在 set_bottom_status) ──▶ window:set_bottom_status(双行 80 级亚像素渐变) + 顶部仅 cwd/时钟
         └─▶ 原版 WezTerm (回退) ──▶ window:set_right_status(单行 FormatItem + cwd/时钟)
 ```
 
@@ -79,18 +83,18 @@ chmod +x /home/xiaolu/agy-quota.wezterm/install.sh
 
 1. 软链接 `./agy-plugin` → `~/.gemini/config/plugins/agy-quota-wezterm-bridge`（注册 Antigravity Hook 桥接插件）。
 2. 软链接仓库根目录 → `~/.local/share/wezterm/plugins/httpssCssZssZsgithubsDscomsZsfan249720142-droidsZsagy-quotasDswezterm`。
-3. 以**只读方式**核验 `~/.gemini/antigravity-cli/settings.json` 中的 `statusLine` 状态，确保未被改动。
+3. 通过 `bin/setup-statusline.mjs` 对 `bin/agy-statusline-feeder.mjs` 执行语法与冒烟校验，再以无 BOM 原子写入方式在 `~/.gemini/antigravity-cli/settings.json` 中配置静默 `statusLine` 遥测泵（`stack_with_default: true`，自动备份原有 `statusLine` 配置，绝不改动其他键；若需完全不触碰 `settings.json`，可加 `--no-statusline` 参数）。
 
 > [!NOTE]
 > **私有仓库与 `wezterm.plugin.require` 说明**：WezTerm 内置 `libgit2` 在拉取私有 GitHub 仓库的 HTTPS URL 时常因缺少交互式凭据而报认证错误。通过上述 slug 软链接，配置中的 `wezterm.plugin.require("https://github.com/fan249720142-droid/agy-quota.wezterm")` 会直接命中本地目录加载，且 `wezterm.plugin.list()` 可正常识别插件路径，无需网络拉取或额外 Git 凭据。
 
-### 2. 卸载软链接
+### 2. 卸载软链接与还原 `statusLine`
 
 ```bash
 /home/xiaolu/agy-quota.wezterm/install.sh --uninstall
 ```
 
-仅移除指向本仓库的软链接，不会修改 `settings.json` 或删除用户非软链接文件。
+移除指向本仓库的软链接，并将 `~/.gemini/antigravity-cli/settings.json` 中的 `statusLine` 还原为安装前备份（或移回默认内置状态栏），不删除任何其他配置。
 
 ---
 
@@ -213,6 +217,11 @@ agy_quota.apply_to_config(config, {
 | `bottom_bar_width` | `10` | `wezterm-custom` 底部双行标准模式进度条宽度 |
 | `bottom_compact_bar_width` | `4` | `wezterm-custom` 底部双行紧凑模式（`effective < bottom_compact_cols`）进度条宽度 |
 | `bottom_compact_cols` | `85` | 底部双行触发紧凑标签的阈值列数（默认 105 列、`cols_offset=18` 时为 `87 >= 85`，可完整显示） |
+| `bottom_right_padding` | `1` | 底部双行渲染文本末尾预留的右侧对齐空格数 |
+| `bar_style` | `"subpixel"` | `"subpixel"`（1/8 亚像素 80 级进度条 + 暗色轨道底槽）或 `"block"`（经典 `█`/`░`） |
+| `context_limit_mode` | `"effective"` | `"effective"`（按 4 层自动压缩软上限计算）或 `"physical"`（按模型物理窗口上限计算） |
+| `expired_reset_grace_secs` | `60` | 配额超过 `reset_epoch` 宽限秒数后自动归一化为已重置（`100%`） |
+| `failed_poll_backoff_secs` | `15` | LS RPC 拉取失败后的退避间隔（秒），防止后台高频空转 |
 | `separator` | `" │ "` | 指标段之间的分隔符 |
 | `hide_context_outside_agy` | `true` | `only_when_agy = false` 时，在非 `agy` 进程隐藏 `Cached` 与 `Context` |
 | `hide_when_empty` | `false` | 无配额与上下文数据时隐藏整个状态段 |
