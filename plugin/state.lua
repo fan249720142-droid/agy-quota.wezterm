@@ -11,6 +11,9 @@ M.DEFAULTS = {
   poll_interval_secs = 30,
   active_poll_interval_secs = 3,
   spawn_cooldown_secs = 2,
+  failed_poll_backoff_secs = 15,
+  expired_reset_grace_secs = 60,
+  context_limit_mode = "effective", -- "effective" (compaction ceiling) | "physical" (model max window)
   proc_cache_ttl_secs = 2,
   pane_prune_ttl_secs = 60,
   only_when_agy = true,
@@ -719,7 +722,7 @@ function M.resolve_pool(quota_data, pane_data, opts)
   return nil, nil
 end
 
-local function normalize_window(win)
+local function normalize_window(win, now, grace_secs)
   if type(win) ~= "table" then
     return nil
   end
@@ -729,6 +732,19 @@ local function normalize_window(win)
   if remaining_pct then
     remaining_pct = clamp(remaining_pct, 0, 100)
   end
+
+  local grace = type(grace_secs) == "number" and grace_secs or 60
+  if type(now) == "number" and type(reset_epoch) == "number" and reset_epoch > 0 and grace >= 0 then
+    if (reset_epoch + grace) <= now then
+      return {
+        remaining_pct = 100,
+        reset_time = nil,
+        reset_epoch = nil,
+        expired_reset = true,
+      }
+    end
+  end
+
   return {
     remaining_pct = remaining_pct,
     reset_time = reset_time,
@@ -736,15 +752,18 @@ local function normalize_window(win)
   }
 end
 
-local function normalize_context(pane_data)
+local function normalize_context(pane_data, opts)
   local ctx = type(pane_data) == "table" and type(pane_data.context) == "table" and pane_data.context or nil
   if not ctx then
     return nil
   end
   local used_tokens = to_number(ctx.used_tokens)
   local window_size = to_number(ctx.context_window_size)
+  local effective_limit = to_number(ctx.effective_context_limit)
   local used_pct = to_number(ctx.used_pct)
   local remaining_pct = to_number(ctx.remaining_pct)
+  local effective_used_pct = to_number(ctx.effective_used_pct)
+  local effective_remaining_pct = to_number(ctx.effective_remaining_pct)
   local cached_pct = to_number(ctx.cached_pct)
 
   if used_pct == nil and used_tokens ~= nil and window_size ~= nil and window_size > 0 then
@@ -761,19 +780,45 @@ local function normalize_context(pane_data)
   elseif remaining_pct ~= nil then
     remaining_pct = clamp(remaining_pct, 0, 100)
   end
+
+  if effective_used_pct == nil and used_tokens ~= nil and effective_limit ~= nil and effective_limit > 0 then
+    effective_used_pct = clamp((used_tokens / effective_limit) * 100, 0, 100)
+  elseif effective_used_pct ~= nil then
+    effective_used_pct = clamp(effective_used_pct, 0, 100)
+  end
+  if effective_remaining_pct == nil and effective_used_pct ~= nil then
+    effective_remaining_pct = clamp(100 - effective_used_pct, 0, 100)
+  elseif effective_remaining_pct ~= nil then
+    effective_remaining_pct = clamp(effective_remaining_pct, 0, 100)
+  end
+
   if cached_pct ~= nil then
     cached_pct = clamp(cached_pct, 0, 100)
   end
 
+  local limit_mode = (type(opts) == "table" and type(opts.context_limit_mode) == "string" and opts.context_limit_mode)
+    or M.DEFAULTS.context_limit_mode
+  local use_effective = (limit_mode ~= "physical") and (effective_limit ~= nil and effective_limit > 0)
+  local display_window_size = use_effective and effective_limit or window_size
+  local display_used_pct = use_effective and (effective_used_pct or used_pct) or used_pct
+  local display_remaining_pct = use_effective and (effective_remaining_pct or remaining_pct) or remaining_pct
+
   return {
     used_tokens = used_tokens,
     context_window_size = window_size,
+    effective_context_limit = effective_limit,
     used_pct = used_pct,
     remaining_pct = remaining_pct,
+    effective_used_pct = effective_used_pct,
+    effective_remaining_pct = effective_remaining_pct,
+    display_window_size = display_window_size,
+    display_used_pct = display_used_pct,
+    display_remaining_pct = display_remaining_pct,
     cached_pct = cached_pct,
     input_tokens = to_number(ctx.input_tokens),
     output_tokens = to_number(ctx.output_tokens),
     cache_read_tokens = to_number(ctx.cache_read_tokens),
+    cache_creation_tokens = to_number(ctx.cache_creation_tokens),
     source = type(ctx.source) == "string" and ctx.source or nil,
   }
 end
@@ -848,8 +893,11 @@ function M.get_snapshot(pane, opts, now, force)
   end
 
   local quota_ts = quota_data and M.parse_epoch(quota_data.fetched_at) or nil
+  local quota_attempt_ts = quota_data and M.parse_epoch(quota_data.last_poll_attempt_at) or nil
   local poll_interval = opts.poll_interval_secs or 30
+  local failed_backoff = opts.failed_poll_backoff_secs or 15
   local quota_stale = (quota_data == nil) or (quota_ts == nil) or ((now - quota_ts) >= poll_interval)
+  local quota_attempt_recent = (quota_attempt_ts ~= nil) and ((now - quota_attempt_ts) < failed_backoff)
 
   local pane_ts = pane_data and M.parse_epoch(pane_data.updated_at) or nil
   local active_interval = opts.active_poll_interval_secs or 3
@@ -858,11 +906,16 @@ function M.get_snapshot(pane, opts, now, force)
     pane_stale = pid_changed or (pane_data == nil) or (pane_ts == nil) or ((now - pane_ts) >= active_interval)
   end
 
+  local should_spawn_for_quota = quota_stale and (not quota_attempt_recent)
   local allow_spawn = (force == true) or (is_agy == true) or (opts.only_when_agy == false)
-  if allow_spawn and (force or quota_stale or pane_stale) then
+  if allow_spawn and (force or should_spawn_for_quota or pane_stale) then
     M.spawn_refresh(pane_id, cwd, opts, now, force or pid_changed, { agy_pid = agy_pid, tty = tty })
   end
 
+  local grace_secs = opts.expired_reset_grace_secs
+  if grace_secs == nil then
+    grace_secs = M.DEFAULTS.expired_reset_grace_secs
+  end
   local pool_key, pool_data = M.resolve_pool(quota_data, pane_data, opts)
   local pane_pool_label = type(pane_data) == "table"
     and (pane_data.pool == nil or pane_data.pool == pool_key)
@@ -898,9 +951,9 @@ function M.get_snapshot(pane, opts, now, force)
     model_id = pane_data and pane_data.model_id or nil,
     model_display_name = pane_data and pane_data.model_display_name or nil,
     agent_state = pane_data and pane_data.agent_state or nil,
-    five_hour = pool_data and normalize_window(pool_data.five_hour) or nil,
-    weekly = pool_data and normalize_window(pool_data.weekly) or nil,
-    context = normalize_context(pane_data),
+    five_hour = pool_data and normalize_window(pool_data.five_hour, now, grace_secs) or nil,
+    weekly = pool_data and normalize_window(pool_data.weekly, now, grace_secs) or nil,
+    context = normalize_context(pane_data, opts),
     raw_quota = quota_data,
     raw_pane = pane_data,
   }

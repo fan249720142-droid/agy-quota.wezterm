@@ -18,6 +18,8 @@ M.DEFAULTS = {
   bottom_bar_width = 10,
   bottom_compact_bar_width = 4,
   bottom_compact_cols = 85,
+  bottom_right_padding = 1,
+  bar_style = "subpixel", -- "subpixel" (1/8 blocks + track bg) | "block" (classic █/░)
   bottom_bar_filled_char = "█",
   bottom_bar_empty_char = "░",
   bar_filled_char = "█",
@@ -29,15 +31,19 @@ M.DEFAULTS = {
   colors = {
     label = "#a9b0c2",
     tokens = "#8c92a4",
+    token_limit = "#d6dae6",
     separator = "#4e5568",
     countdown = "#57caff",
     bar_empty = "#3b4052",
+    bar_track = "#2b303c",
     muted = "#6c7386",
     pool = "#e6dcc3",
     pool_gemini = "#89b4fa",
     pool_3p = "#d4bdf5",
   },
 }
+
+local PARTIAL_BLOCKS = { "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" }
 
 local STOPS = {
   red = { 255, 85, 85 },     -- #ff5555 @ 0%
@@ -201,6 +207,22 @@ function M.format_tokens(count, mode)
   return string.format("%d", M.round(count))
 end
 
+function M.format_token_fraction(used, total, mode)
+  local used_s = M.format_tokens(used, mode)
+  local total_s = M.format_tokens(total, mode)
+  if not used_s or not total_s then
+    return nil, nil
+  end
+  if mode == "compact" then
+    local u_unit = used_s:sub(-1)
+    local t_unit = total_s:sub(-1)
+    if (u_unit == "k" or u_unit == "M") and u_unit == t_unit then
+      used_s = used_s:sub(1, -2)
+    end
+  end
+  return used_s, total_s
+end
+
 local function format_pct(val, decimals)
   if type(val) ~= "number" or val ~= val then
     return "--"
@@ -299,11 +321,57 @@ local function push_text(cells, color, text)
   table.insert(cells, { Text = text })
 end
 
+local function should_use_subpixel_bar(opts)
+  if type(opts) == "table" then
+    if opts.bar_style == "block" then
+      return false
+    end
+    if opts.bar_style == "subpixel" then
+      return true
+    end
+    local custom_filled = opts.bar_filled_char ~= nil and opts.bar_filled_char ~= M.DEFAULTS.bar_filled_char
+    local custom_empty = opts.bar_empty_char ~= nil and opts.bar_empty_char ~= M.DEFAULTS.bar_empty_char
+    if custom_filled or custom_empty then
+      return false
+    end
+  end
+  return M.DEFAULTS.bar_style == "subpixel"
+end
+
 local function push_bar(cells, pct, width, fill_color, opts, colors)
   if width <= 0 or type(pct) ~= "number" then
     return
   end
-  local filled = M.round(M.clamp(pct, 0, 100) / 100 * width)
+  local clamped = M.clamp(pct, 0, 100)
+  if should_use_subpixel_bar(opts) then
+    local total_eighths = M.round(clamped / 100 * width * 8)
+    local full = math.floor(total_eighths / 8)
+    local rem = total_eighths % 8
+    local empty = width - full - (rem > 0 and 1 or 0)
+    local track_bg = colors.bar_track or M.DEFAULTS.colors.bar_track
+
+    if full > 0 then
+      push_text(cells, fill_color, string.rep("█", full))
+    end
+    if rem > 0 then
+      if type(track_bg) == "string" and track_bg ~= "" then
+        table.insert(cells, { Background = { Color = track_bg } })
+      end
+      push_text(cells, fill_color, PARTIAL_BLOCKS[rem + 1])
+    end
+    if empty > 0 then
+      if type(track_bg) == "string" and track_bg ~= "" then
+        table.insert(cells, { Background = { Color = track_bg } })
+      end
+      table.insert(cells, { Text = string.rep(" ", empty) })
+    end
+    if (rem > 0 or empty > 0) and type(track_bg) == "string" and track_bg ~= "" then
+      table.insert(cells, { Background = { Color = "Default" } })
+    end
+    return
+  end
+
+  local filled = M.round(clamped / 100 * width)
   local empty = width - filled
   local filled_char = (opts and opts.bar_filled_char) or M.DEFAULTS.bar_filled_char
   local empty_char = (opts and opts.bar_empty_char) or M.DEFAULTS.bar_empty_char
@@ -395,20 +463,23 @@ local function add_context_segments(segments, ctx, cfg, bar_width, bar_opts, col
     end)
   end
 
-  if ctx.used_pct ~= nil then
+  local disp_pct = ctx.display_used_pct ~= nil and ctx.display_used_pct or ctx.used_pct
+  local disp_win = ctx.display_window_size ~= nil and ctx.display_window_size or ctx.context_window_size
+
+  if disp_pct ~= nil then
     add_segment(segments, function(seg)
-      local col = M.context_color(ctx.used_pct)
+      local col = M.context_color(disp_pct)
       push_text(seg, colors.label, cfg.ctx_label .. " ")
-      push_text(seg, col, format_pct(ctx.used_pct, cfg.ctx_decimals))
+      push_text(seg, col, format_pct(disp_pct, cfg.ctx_decimals))
       if cfg.show_ctx_bar and bar_width > 0 then
         push_text(seg, nil, " ")
-        push_bar(seg, ctx.used_pct, bar_width, col, bar_opts, colors)
+        push_bar(seg, disp_pct, bar_width, col, bar_opts, colors)
       end
-      if cfg.show_tokens and ctx.used_tokens ~= nil and ctx.context_window_size ~= nil then
-        local used_s = M.format_tokens(ctx.used_tokens, cfg.token_mode)
-        local total_s = M.format_tokens(ctx.context_window_size, cfg.token_mode)
+      if cfg.show_tokens and ctx.used_tokens ~= nil and disp_win ~= nil then
+        local used_s, total_s = M.format_token_fraction(ctx.used_tokens, disp_win, cfg.token_mode)
         if used_s and total_s then
-          push_text(seg, colors.tokens, " " .. used_s .. "/" .. total_s)
+          push_text(seg, col, " " .. used_s)
+          push_text(seg, colors.token_limit or colors.tokens, "/" .. total_s)
         end
       end
     end)
@@ -502,8 +573,9 @@ function M.render_bottom_lines(snapshot, cols, opts)
   end
 
   local bar_opts = {
-    bar_filled_char = opts.bottom_bar_filled_char or opts.bar_filled_char or M.DEFAULTS.bottom_bar_filled_char,
-    bar_empty_char = opts.bottom_bar_empty_char or opts.bar_empty_char or M.DEFAULTS.bottom_bar_empty_char,
+    bar_style = opts.bar_style,
+    bar_filled_char = opts.bottom_bar_filled_char or opts.bar_filled_char,
+    bar_empty_char = opts.bottom_bar_empty_char or opts.bar_empty_char,
   }
 
   local show_pool = resolve_bool_opt(opts, "show_pool", M.DEFAULTS.show_pool)
@@ -536,7 +608,7 @@ function M.render_bottom_lines(snapshot, cols, opts)
   local line1_segments = {}
   local ctx = snapshot.context
   if show_context then
-    local has_ctx = type(ctx) == "table" and (ctx.cached_pct ~= nil or ctx.used_pct ~= nil)
+    local has_ctx = type(ctx) == "table" and (ctx.cached_pct ~= nil or ctx.display_used_pct ~= nil or ctx.used_pct ~= nil)
     if has_ctx then
       add_context_segments(line1_segments, ctx, cfg, bar_width, bar_opts, colors)
     elseif not hide_when_empty then
@@ -596,7 +668,19 @@ function M.render_bottom_text(snapshot, cols, opts)
   if #lines.line1 == 0 and #lines.line2 == 0 then
     return ""
   end
-  return format_items(lines.line1) .. "\n" .. format_items(lines.line2)
+  local pad_count = (type(opts) == "table" and type(opts.bottom_right_padding) == "number")
+    and math.max(0, math.floor(opts.bottom_right_padding))
+    or M.DEFAULTS.bottom_right_padding
+  local pad = pad_count > 0 and string.rep(" ", pad_count) or ""
+  local l1 = format_items(lines.line1)
+  local l2 = format_items(lines.line2)
+  if l1 ~= "" and pad ~= "" then
+    l1 = l1 .. pad
+  end
+  if l2 ~= "" and pad ~= "" then
+    l2 = l2 .. pad
+  end
+  return l1 .. "\n" .. l2
 end
 
 function M.cells_to_plain_text(cells)
