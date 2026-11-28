@@ -271,10 +271,10 @@ test("responsive full / compact / minimal rendering and colors", function()
     return false
   end
 
-  local function has_bg_color(cells, color)
+  local function has_any_bg(cells)
     for i = 1, #cells do
       local item = cells[i]
-      if item.Background and item.Background.Color == color then
+      if type(item) == "table" and item.Background ~= nil then
         return true
       end
     end
@@ -285,8 +285,8 @@ test("responsive full / compact / minimal rendering and colors", function()
   local full_text = render.cells_to_plain_text(full_cells)
   assert_eq(
     full_text,
-    "Gemini │ Cached 99.1% │ Context 35.9% ██▉      376.2k/1.0M │ Five Hours 49% ███▉     1h21m │ Weekly 86% ██████▉  6d20h",
-    "full layout text (subpixel 80-level bar)"
+    "Gemini │ Cached 99.1% │ Context 35.9% ██▉░░░░░ 376.2k/1.0M │ Five Hours 49% ███▉░░░░ 1h21m │ Weekly 86% ██████▉░ 6d20h",
+    "full layout text (transparent subpixel 80-level bar)"
   )
   assert_eq(
     render.cells_to_plain_text(render.render_cells(snap, 140, { layout = "auto" })),
@@ -303,24 +303,29 @@ test("responsive full / compact / minimal rendering and colors", function()
   )
   assert_true(has_fg_color(full_block_cells, "#3b4052"), "block empty bar uses #3b4052")
 
-  -- Verify countdown color #57caff, subpixel bar track + transparent reset, and gemini pool color #89b4fa
+  -- Default transparent subpixel bar emits ZERO Background SGR (never white box!)
+  assert_true(not has_any_bg(full_cells), "default subpixel bar emits zero Background cells for full transparency")
   assert_true(has_fg_color(full_cells, "#57caff"), "countdown uses #57caff")
-  assert_true(has_bg_color(full_cells, "#2b303c"), "subpixel bar track uses #2b303c")
-  assert_true(has_bg_color(full_cells, "Default"), "subpixel bar restores Default background for transparency")
+  assert_true(has_fg_color(full_cells, "#3b4052"), "transparent empty bar uses #3b4052")
   assert_true(has_fg_color(full_cells, "#89b4fa"), "gemini pool uses #89b4fa")
+
+  -- Optional subpixel_track style uses ResetAttributes (\x1b[49m), never white #ffffff background
+  local track_ansi = wezterm.format(render.render_cells(snap, 160, { layout = "auto", bar_style = "subpixel_track" }))
+  assert_true(track_ansi:find("48:2::255:255:255", 1, true) == nil, "subpixel_track never emits white background")
+  assert_true(track_ansi:find("\x1b%[49m") ~= nil, "subpixel_track resets background cleanly via ResetAttributes")
 
   local compact_cells = render.render_cells(snap, 105, { layout = "auto" })
   local compact_text = render.cells_to_plain_text(compact_cells)
   assert_eq(
     compact_text,
-    "Gemini │ C 99% │ Ctx 35.9% █▍   376k/1.0M │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+    "Gemini │ C 99% │ Ctx 35.9% █▍░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
     "compact layout text at 105 cols"
   )
 
   local minimal_cells = render.render_cells(snap, 80, { layout = "auto" })
   assert_eq(
     render.cells_to_plain_text(minimal_cells),
-    "Gem │ Ctx 36% │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+    "Gem │ Ctx 36% │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
     "minimal layout text at 80 cols keeps 5h/Wk progress bars"
   )
 
@@ -350,7 +355,7 @@ test("responsive full / compact / minimal rendering and colors", function()
   local compact_3p = render.render_cells(snap_3p, 105, { layout = "auto" })
   assert_eq(
     render.cells_to_plain_text(compact_3p),
-    "Claude/GPT │ C 98% │ Ctx 37.7% █▌   395k/1.0M │ 5h 59% ██▍  3h53m │ Wk 86% ███▌ 6d0h",
+    "Claude/GPT │ C 98% │ Ctx 37.7% █▌░░ 395k/1.0M │ 5h 59% ██▍░ 3h53m │ Wk 86% ███▌ 6d0h",
     "3p compact layout text"
   )
   assert_true(has_fg_color(compact_3p, "#d4bdf5"), "3p pool uses #d4bdf5")
@@ -358,7 +363,7 @@ test("responsive full / compact / minimal rendering and colors", function()
   local minimal_3p = render.render_cells(snap_3p, 80, { layout = "auto" })
   assert_eq(
     render.cells_to_plain_text(minimal_3p),
-    "Cld │ Ctx 38% │ 5h 59% ██▍  3h53m │ Wk 86% ███▌ 6d0h",
+    "Cld │ Ctx 38% │ 5h 59% ██▍░ 3h53m │ Wk 86% ███▌ 6d0h",
     "3p minimal layout text"
   )
 
@@ -379,7 +384,7 @@ test("responsive full / compact / minimal rendering and colors", function()
   })
   assert_eq(
     render.cells_to_plain_text(outside_default),
-    "Gemini │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+    "Gemini │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
     "context hidden outside agy when only_when_agy=false"
   )
 
@@ -389,7 +394,7 @@ test("responsive full / compact / minimal rendering and colors", function()
   })
   assert_eq(
     render.cells_to_plain_text(outside_shown),
-    "Gemini │ C 99% │ Ctx 35.9% █▍   376k/1.0M │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+    "Gemini │ C 99% │ Ctx 35.9% █▍░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
     "context shown outside agy when configured with only_when_agy=false"
   )
 end)
@@ -593,7 +598,7 @@ test("JSON cache reading, memory throttling, malformed JSON safety, and stale re
     )
     assert_eq(
       render.cells_to_plain_text(cells_t0),
-      "Gemini │ C 99% │ Ctx 35.9% █▍   376k/1.0M │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+      "Gemini │ C 99% │ Ctx 35.9% █▍░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
       "countdown at now=1006"
     )
 
@@ -606,7 +611,7 @@ test("JSON cache reading, memory throttling, malformed JSON safety, and stale re
     local cells_t1 = render.render_cells(s_fresh, 105, {})
     assert_eq(
       render.cells_to_plain_text(cells_t1),
-      "Gemini │ C 99% │ Ctx 35.9% █▍   376k/1.0M │ 5h 49% ██   1h20m │ Wk 86% ███▌ 6d19h",
+      "Gemini │ C 99% │ Ctx 35.9% █▍░░ 376k/1.0M │ 5h 49% ██░░ 1h20m │ Wk 86% ███▌ 6d19h",
       "countdown ticks dynamically at now=1007"
     )
 
@@ -758,7 +763,7 @@ test("composable API, layout cycling, and apply_to_config integration", function
     local cells = plugin.get_status_cells(win, pane, nil, 2000)
     assert_eq(
       render.cells_to_plain_text(cells),
-      "Gemini │ C 99% │ Ctx 35.9% █▍   376k/1.0M │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+      "Gemini │ C 99% │ Ctx 35.9% █▍░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
       "get_status_cells output"
     )
 
@@ -782,7 +787,7 @@ test("composable API, layout cycling, and apply_to_config integration", function
     local wide_win = make_mock_window(100, narrow_split_pane, 150)
     assert_eq(
       render.cells_to_plain_text(plugin.get_status_cells(wide_win, narrow_split_pane, nil, 2000)),
-      "Gemini │ Cached 99.1% │ Context 35.9% ██▉      376.2k/1.0M │ Five Hours 49% ███▉     1h21m │ Weekly 86% ██████▉  6d20h",
+      "Gemini │ Cached 99.1% │ Context 35.9% ██▉░░░░░ 376.2k/1.0M │ Five Hours 49% ███▉░░░░ 1h21m │ Weekly 86% ██████▉░ 6d20h",
       "tab:get_size().cols determines full-bar layout even on narrow split pane"
     )
 
@@ -791,19 +796,19 @@ test("composable API, layout cycling, and apply_to_config integration", function
     assert_eq(plugin.cycle_layout(win), "full", "cycle -> full")
     assert_eq(
       render.cells_to_plain_text(plugin.get_status_cells(win, pane, nil, 2000)),
-      "Gemini │ Cached 99.1% │ Context 35.9% ██▉      376.2k/1.0M │ Five Hours 49% ███▉     1h21m │ Weekly 86% ██████▉  6d20h",
+      "Gemini │ Cached 99.1% │ Context 35.9% ██▉░░░░░ 376.2k/1.0M │ Five Hours 49% ███▉░░░░ 1h21m │ Weekly 86% ██████▉░ 6d20h",
       "overridden full layout on 105-col pane"
     )
     assert_eq(plugin.cycle_layout(win), "compact", "cycle -> compact")
     assert_eq(
       render.cells_to_plain_text(plugin.get_status_cells(win, pane, nil, 2000)),
-      "Gemini │ C 99% │ Ctx 35.9% █▍   376k/1.0M │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+      "Gemini │ C 99% │ Ctx 35.9% █▍░░ 376k/1.0M │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
       "overridden compact layout"
     )
     assert_eq(plugin.cycle_layout(win), "minimal", "cycle -> minimal")
     assert_eq(
       render.cells_to_plain_text(plugin.get_status_cells(win, pane, nil, 2000)),
-      "Gem │ Ctx 36% │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+      "Gem │ Ctx 36% │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
       "overridden minimal layout"
     )
     assert_eq(plugin.cycle_layout(win), "auto", "cycle -> auto")
@@ -977,7 +982,7 @@ test("switching pane_<id>.json from gemini to 3p immediately updates pool label,
     local gem_text = render.cells_to_plain_text(gem_cells)
     assert_eq(
       gem_text,
-      "Gemini │ C 98% │ Ctx 37.7% █▌   395k/1.0M │ 5h 59% ██▍  3h53m │ Wk 86% ███▌ 6d0h",
+      "Gemini │ C 98% │ Ctx 37.7% █▌░░ 395k/1.0M │ 5h 59% ██▍░ 3h53m │ Wk 86% ███▌ 6d0h",
       "initial gemini pool bar"
     )
     assert_true(has_color(gem_cells, "#89b4fa"), "gemini pool uses #89b4fa")
@@ -986,7 +991,7 @@ test("switching pane_<id>.json from gemini to 3p immediately updates pool label,
     local gem_min_text = render.cells_to_plain_text(plugin.get_status_cells(win, pane, { layout = "minimal" }, 4000))
     assert_eq(
       gem_min_text,
-      "Gem │ Ctx 38% │ 5h 59% ██▍  3h53m │ Wk 86% ███▌ 6d0h",
+      "Gem │ Ctx 38% │ 5h 59% ██▍░ 3h53m │ Wk 86% ███▌ 6d0h",
       "initial gemini minimal bar"
     )
     assert_eq(utf8.len(gem_min_text), 52, "minimal layout is exactly 52 display chars")
@@ -1013,7 +1018,7 @@ test("switching pane_<id>.json from gemini to 3p immediately updates pool label,
     local claude_text = render.cells_to_plain_text(claude_cells)
     assert_eq(
       claude_text,
-      "Claude/GPT │ C 98% │ Ctx 37.7% █▌   395k/1.0M │ 5h 24% █    1h59m │ Wk 71% ██▉  4d0h",
+      "Claude/GPT │ C 98% │ Ctx 37.7% █▌░░ 395k/1.0M │ 5h 24% █░░░ 1h59m │ Wk 71% ██▉░ 4d0h",
       "switched immediately to Claude/GPT pool and 3p quota percentages"
     )
     assert_true(has_color(claude_cells, "#d4bdf5"), "3p pool uses #d4bdf5")
@@ -1022,7 +1027,7 @@ test("switching pane_<id>.json from gemini to 3p immediately updates pool label,
     local claude_min_text = render.cells_to_plain_text(plugin.get_status_cells(win, pane, { layout = "minimal" }, 4001.5))
     assert_eq(
       claude_min_text,
-      "Cld │ Ctx 38% │ 5h 24% █    1h59m │ Wk 71% ██▉  4d0h",
+      "Cld │ Ctx 38% │ 5h 24% █░░░ 1h59m │ Wk 71% ██▉░ 4d0h",
       "switched minimal bar to Cld and 3p percentages"
     )
     assert_eq(utf8.len(claude_min_text), 52, "minimal Cld layout is exactly 52 display chars")
@@ -1106,21 +1111,23 @@ test("render_bottom_lines and render_bottom_text render 2-line Gemini/3p/compact
   local lines_full = render.render_bottom_lines(snap_gemini, 120, {})
   assert_eq(
     render.cells_to_plain_text(lines_full.line1),
-    "Cached 99.1% │ Context 35.9% ███▋       376.2k/1.0M",
-    "bottom line 1 full Gemini (subpixel)"
+    "Cached 99.1% │ Context 35.9% ███▋░░░░░░ 376.2k/1.0M",
+    "bottom line 1 full Gemini (transparent subpixel)"
   )
   assert_eq(
     render.cells_to_plain_text(lines_full.line2),
-    "Gemini │ Five Hours 49% ████▉      1h21m │ Weekly 86% ████████▋  6d20h",
-    "bottom line 2 full Gemini (subpixel)"
+    "Gemini │ Five Hours 49% ████▉░░░░░ 1h21m │ Weekly 86% ████████▋░ 6d20h",
+    "bottom line 2 full Gemini (transparent subpixel)"
   )
   assert_true(has_fg_color(lines_full.line2, "#89b4fa"), "bottom Gemini pool uses #89b4fa")
   assert_true(has_fg_color(lines_full.line2, "#57caff"), "bottom countdown uses #57caff")
+  assert_true(has_fg_color(lines_full.line2, "#3b4052"), "bottom empty bar uses #3b4052")
 
   local bottom_ansi = render.render_bottom_text(snap_gemini, 120, {})
   assert_true(bottom_ansi:find("\n", 1, true) ~= nil, "render_bottom_text joins line1 and line2 with newline")
   assert_true(bottom_ansi:find("Cached ", 1, true) ~= nil and bottom_ansi:find("99%.1%%") ~= nil, "ANSI text has Cached 99.1%")
   assert_true(bottom_ansi:find("Five Hours ", 1, true) ~= nil and bottom_ansi:find("49%%") ~= nil, "ANSI text has Five Hours 49%")
+  assert_true(bottom_ansi:find("\x1b%[48:", 1, false) == nil, "bottom ANSI text emits zero background box codes")
   assert_true(bottom_ansi:sub(-1) == " ", "render_bottom_text appends right padding space by default")
 
   -- 3p / Claude & GPT pool
@@ -1136,7 +1143,7 @@ test("render_bottom_lines and render_bottom_text render 2-line Gemini/3p/compact
   local lines_3p = render.render_bottom_lines(snap_3p, 105, {})
   assert_eq(
     render.cells_to_plain_text(lines_3p.line2),
-    "Claude/GPT │ Five Hours 59% █████▉     3h53m │ Weekly 71% ███████▏   4d1h",
+    "Claude/GPT │ Five Hours 59% █████▉░░░░ 3h53m │ Weekly 71% ███████▏░░ 4d1h",
     "bottom line 2 full 3p"
   )
   assert_true(has_fg_color(lines_3p.line2, "#d4bdf5"), "bottom 3p pool uses #d4bdf5")
@@ -1145,18 +1152,18 @@ test("render_bottom_lines and render_bottom_text render 2-line Gemini/3p/compact
   local lines_narrow = render.render_bottom_lines(snap_gemini, 80, {})
   assert_eq(
     render.cells_to_plain_text(lines_narrow.line1),
-    "C 99% │ Ctx 36% █▍   376k/1.0M",
+    "C 99% │ Ctx 36% █▍░░ 376k/1.0M",
     "bottom line 1 compact when cols < 85"
   )
   assert_eq(
     render.cells_to_plain_text(lines_narrow.line2),
-    "Gem │ 5h 49% ██   1h21m │ Wk 86% ███▌ 6d20h",
+    "Gem │ 5h 49% ██░░ 1h21m │ Wk 86% ███▌ 6d20h",
     "bottom line 2 compact when cols < 85"
   )
   local lines_narrow_3p = render.render_bottom_lines(snap_3p, 80, {})
   assert_eq(
     render.cells_to_plain_text(lines_narrow_3p.line2),
-    "Cld │ 5h 59% ██▍  3h53m │ Wk 71% ██▉  4d1h",
+    "Cld │ 5h 59% ██▍░ 3h53m │ Wk 71% ██▉░ 4d1h",
     "bottom line 2 compact 3p when cols < 85"
   )
 
@@ -1426,8 +1433,8 @@ test("agy_pid, tty forwarding, PID-change forced refresh, and initial 0-usage re
     local lines_init = render.render_bottom_lines(s_reloaded, 120, {})
     assert_eq(
       render.cells_to_plain_text(lines_init.line1),
-      "Cached 0.0% │ Context 0.0%            0/1.0M",
-      "initial 0-usage context renders Cached 0.0% | Context 0.0% empty subpixel track 0/1.0M"
+      "Cached 0.0% │ Context 0.0% ░░░░░░░░░░ 0/1.0M",
+      "initial 0-usage context renders Cached 0.0% | Context 0.0% transparent empty bar 0/1.0M"
     )
     local bottom_init_text = render.render_bottom_text(s_reloaded, 120, {})
     assert_true(bottom_init_text:find("Cached ", 1, true) ~= nil and bottom_init_text:find("0.0%", 1, true) ~= nil, "render_bottom_text contains initial 0.0%")
@@ -1499,12 +1506,12 @@ test("effective context_limit_mode, expired quota grace recovery, failed-poll ba
     local eff_lines = render.render_bottom_lines(snap_eff, 120, {})
     assert_eq(
       render.cells_to_plain_text(eff_lines.line1),
-      "Cached 95.2% │ Context 50.0% █████      128.0k/256.0k",
+      "Cached 95.2% │ Context 50.0% █████░░░░░ 128.0k/256.0k",
       "bottom line 1 displays effective compaction ceiling"
     )
     assert_eq(
       render.cells_to_plain_text(eff_lines.line2),
-      "Gemini │ Five Hours 100% ██████████ │ Weekly 73% ███████▎   4d15h",
+      "Gemini │ Five Hours 100% ██████████ │ Weekly 73% ███████▎░░ 4d15h",
       "expired 5h renders recovered 100% without stale countdown"
     )
 
@@ -1512,7 +1519,7 @@ test("effective context_limit_mode, expired quota grace recovery, failed-poll ba
     local eff_narrow = render.render_bottom_lines(snap_eff, 80, {})
     assert_eq(
       render.cells_to_plain_text(eff_narrow.line1),
-      "C 95% │ Ctx 50% ██   128/256k",
+      "C 95% │ Ctx 50% ██░░ 128/256k",
       "compact same-unit fraction renders 128/256k"
     )
 

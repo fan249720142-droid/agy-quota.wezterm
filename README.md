@@ -9,7 +9,7 @@
 - **双项目拆分与原生底部双行栏 (`wezterm-custom`)**：`wezterm-custom` 负责渲染 `config.bottom_status_rows = 2` 底部独立状态槽位及 `window:set_bottom_status(ansi_text)`；插件通过 `has_bottom_status_api(window)` 自动识别，有该 API 时保留顶部标签栏 (`tab_bar_at_bottom = false`) 与右上角集成按钮，将双行指标渲染至底部，不在顶部重复堆叠配额。
 - **静默 `statusLine` 遥测泵 (`agy-statusline-feeder.mjs`) + 死端点自愈**：通过 `settings.json` 中 `stack_with_default: true` 且 `stdout` 保持静默的轻量遥测泵，直接承接 `agy` 官方实时推送的 `meta.quota`、`meta.context_window`（含 `cache_creation_input_tokens` 与流式防归零）、`meta.model` 与当前活进程的 LS 凭证；在切换 PID 或遇到 `ECONNREFUSED` / `401` 时主动清理过期端点，并以退避间隔 (`failed_poll_backoff_secs`) 避免后台空转。
 - **四层有效上下文软上限 (`context_limit_mode = "effective"`)**：默认按 Antigravity CLI 实际自动压缩软上限（原生字段 → `AGY_TOKEN_CEILING` / settings 覆写 → 运行时 `maxContextTokens` → `GetAvailableModels` `CASCADE_USE_EXPERIMENT_CHECKPOINTER` 的 `max_token_limit` → `256k → 512k → 物理上限` 步进自愈）计算上下文占比与进度条，也可随时在 WezTerm 配置中切回 `context_limit_mode = "physical"`。
-- **80 级 1/8 亚像素进度条 + 过期配额宽限期归位**：默认使用 `▏▎▍▌▋▊▉█` + 暗色底槽 (`bar_track = "#2b303c"`) 并在条末自动恢复透明背景，在 10 格宽实现 80 级平滑填充（亦可通过 `bar_style = "block"` 切回经典 `█`/`░`）；配额桶支持跨窗口防抖合并、Argon/`-wtu` 过滤、唯一 `reset_time` 交叉归池以及重置超过 `expired_reset_grace_secs`（默认 60s）自动归位。
+- **透明 80 级 1/8 亚像素进度条 + 过期配额宽限期归位**：默认使用 `▏▎▍▌▋▊▉█` + 透明底槽 `░`（零背景色 SGR，壁纸完全透明穿透），在 10 格宽实现 80 级平滑填充（亦支持 `bar_style = "block"` 经典 `█`/`░` 或 `bar_style = "subpixel_track"` 暗槽背景）；配额桶支持跨窗口防抖合并、Argon/`-wtu` 过滤、唯一 `reset_time` 交叉归池以及重置超过 `expired_reset_grace_secs`（默认 60s）自动归位。
 - **原版 WezTerm 优雅降级**：若运行在未打补丁的原版 WezTerm（无 `window.set_bottom_status`），`agy_quota.update_bottom_status(...)` 返回 `false`，自动回退到单行 `get_status_cells(...)` + `window:set_right_status(...)`（可按需设 `tab_bar_at_bottom = true` 或留在右上角）。
 - **`agy` 专属可见性 (`only_when_agy = true`)**：仅当当前焦点 Pane 前台进程（或其子进程树）为 `agy` / `agy-cli` / `antigravity` 时显示状态并触发刷新；在普通 Shell Pane 中底部状态返回 `""`（透明不占位），顶部状态栏保持干净的 `cwd` + 时钟（也可设 `only_when_agy = false` 在所有 Pane 显示全局配额）。
 - **动态模型感知切池 (`Gemini` ↔ `Claude/GPT`)**：实时跟踪用户在 CLI 中通过 `/model`、`--model` 参数或会话切换产生的模型变更——综合 `statusLine` 实时模型、只读 `settings.json`、`agy-plugin` Hooks 与增量游标 LS RPC 轨迹元数据，自动在 `Gemini` (`gemini`) 与 `Claude/GPT` (`3p`) 两个配额池之间切换显示对应百分比与倒计时。
@@ -218,7 +218,7 @@ agy_quota.apply_to_config(config, {
 | `bottom_compact_bar_width` | `4` | `wezterm-custom` 底部双行紧凑模式（`effective < bottom_compact_cols`）进度条宽度 |
 | `bottom_compact_cols` | `85` | 底部双行触发紧凑标签的阈值列数（默认 105 列、`cols_offset=18` 时为 `87 >= 85`，可完整显示） |
 | `bottom_right_padding` | `1` | 底部双行渲染文本末尾预留的右侧对齐空格数 |
-| `bar_style` | `"subpixel"` | `"subpixel"`（1/8 亚像素 80 级进度条 + 暗色轨道底槽）或 `"block"`（经典 `█`/`░`） |
+| `bar_style` | `"subpixel"` | `"subpixel"`（透明 1/8 亚像素 80 级进度条 + `░`，无背景块）、`"subpixel_track"`（带暗色底槽）或 `"block"`（经典 `█`/`░`） |
 | `context_limit_mode` | `"effective"` | `"effective"`（按 4 层自动压缩软上限计算）或 `"physical"`（按模型物理窗口上限计算） |
 | `expired_reset_grace_secs` | `60` | 配额超过 `reset_epoch` 宽限秒数后自动归一化为已重置（`100%`） |
 | `failed_poll_backoff_secs` | `15` | LS RPC 拉取失败后的退避间隔（秒），防止后台高频空转 |

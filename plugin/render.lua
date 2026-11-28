@@ -19,7 +19,7 @@ M.DEFAULTS = {
   bottom_compact_bar_width = 4,
   bottom_compact_cols = 85,
   bottom_right_padding = 1,
-  bar_style = "subpixel", -- "subpixel" (1/8 blocks + track bg) | "block" (classic █/░)
+  bar_style = "subpixel", -- "subpixel" (transparent 1/8 blocks + ░) | "subpixel_track" (1/8 blocks + track bg) | "block" (classic █/░)
   bottom_bar_filled_char = "█",
   bottom_bar_empty_char = "░",
   bar_filled_char = "█",
@@ -321,21 +321,18 @@ local function push_text(cells, color, text)
   table.insert(cells, { Text = text })
 end
 
-local function should_use_subpixel_bar(opts)
+local function resolve_bar_style(opts)
   if type(opts) == "table" then
-    if opts.bar_style == "block" then
-      return false
-    end
-    if opts.bar_style == "subpixel" then
-      return true
+    if opts.bar_style == "block" or opts.bar_style == "subpixel" or opts.bar_style == "subpixel_track" then
+      return opts.bar_style
     end
     local custom_filled = opts.bar_filled_char ~= nil and opts.bar_filled_char ~= M.DEFAULTS.bar_filled_char
     local custom_empty = opts.bar_empty_char ~= nil and opts.bar_empty_char ~= M.DEFAULTS.bar_empty_char
     if custom_filled or custom_empty then
-      return false
+      return "block"
     end
   end
-  return M.DEFAULTS.bar_style == "subpixel"
+  return M.DEFAULTS.bar_style
 end
 
 local function push_bar(cells, pct, width, fill_color, opts, colors)
@@ -343,7 +340,27 @@ local function push_bar(cells, pct, width, fill_color, opts, colors)
     return
   end
   local clamped = M.clamp(pct, 0, 100)
-  if should_use_subpixel_bar(opts) then
+  local style = resolve_bar_style(opts)
+  local empty_char = (opts and opts.bar_empty_char) or M.DEFAULTS.bar_empty_char
+
+  if style == "subpixel" then
+    -- Transparent 1/8 sub-pixel progress bar: zero Background SGR so wallpaper shines through.
+    local total_eighths = M.round(clamped / 100 * width * 8)
+    local full = math.floor(total_eighths / 8)
+    local rem = total_eighths % 8
+    local empty = width - full - (rem > 0 and 1 or 0)
+
+    local filled_part = (full > 0 and string.rep("█", full) or "") .. (rem > 0 and PARTIAL_BLOCKS[rem + 1] or "")
+    if filled_part ~= "" then
+      push_text(cells, fill_color, filled_part)
+    end
+    if empty > 0 then
+      push_text(cells, colors.bar_empty, string.rep(empty_char, empty))
+    end
+    return
+  end
+
+  if style == "subpixel_track" then
     local total_eighths = M.round(clamped / 100 * width * 8)
     local full = math.floor(total_eighths / 8)
     local rem = total_eighths % 8
@@ -366,7 +383,7 @@ local function push_bar(cells, pct, width, fill_color, opts, colors)
       table.insert(cells, { Text = string.rep(" ", empty) })
     end
     if (rem > 0 or empty > 0) and type(track_bg) == "string" and track_bg ~= "" then
-      table.insert(cells, { Background = { Color = "Default" } })
+      table.insert(cells, "ResetAttributes")
     end
     return
   end
@@ -374,7 +391,6 @@ local function push_bar(cells, pct, width, fill_color, opts, colors)
   local filled = M.round(clamped / 100 * width)
   local empty = width - filled
   local filled_char = (opts and opts.bar_filled_char) or M.DEFAULTS.bar_filled_char
-  local empty_char = (opts and opts.bar_empty_char) or M.DEFAULTS.bar_empty_char
   if filled > 0 then
     push_text(cells, fill_color, string.rep(filled_char, filled))
   end
