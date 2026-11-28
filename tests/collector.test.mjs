@@ -2213,6 +2213,96 @@ test('setup-statusline.mjs atomically installs, backs up, and restores settings.
   assert.equal(afterUninstall.model, 'Gemini 4 Neon (High)');
 });
 
+test('Idle SQLite FD closure on same agy PID preserves cached/context metrics and epoch-0 resetTime normalizes to null', async (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const statusDir = path.join(tmpDir, 'status');
+  const nowMs = Date.now();
+  const nowEpoch = Math.floor(nowMs / 1000);
+
+  // 1. statusLine feeds real conversation metrics + 3p epoch-0 reset_time ("1970-01-01T00:00:00Z")
+  const slRes = applyStatusLineMeta({
+    meta: {
+      conversation_id: 'conv-idle-preserve',
+      cwd: tmpDir,
+      model: { id: 'gemini-4-neon-high', display_name: 'Gemini 4 Neon (High)' },
+      agent_state: 'idle',
+      context_window: {
+        total_input_tokens: 405000,
+        total_output_tokens: 500,
+        context_window_size: 1048576,
+        current_usage: {
+          input_tokens: 2600,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 402400,
+          output_tokens: 500,
+        },
+      },
+      quota: {
+        '3p-5h': { remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' },
+        'gemini-5h': { remaining_fraction: 0.66, reset_in_seconds: 5400 },
+      },
+    },
+    pane: '0',
+    agyPid: 120538,
+    statusDir,
+    env: {},
+    nowMs,
+  });
+  assert.equal(slRes.pane.context.used_tokens, 405000);
+  assert.equal(slRes.pane.context.cached_pct, 99.36);
+  assert.equal(slRes.quota.pools['3p'].five_hour.reset_time, null, '1970-01-01T00:00:00Z must normalize to null');
+  assert.equal(slRes.quota.pools['3p'].five_hour.reset_epoch, null, 'epoch 0 must normalize to null');
+
+  // 2. Simulate agy closing its idle SQLite `.db` FD while sitting idle on the SAME PID (120538)
+  const idleRefresh = await runRefresh({
+    statusDir,
+    pane: '0',
+    cwd: tmpDir,
+    agyPid: 120538,
+    nowMs: nowMs + 5000,
+    env: {},
+    geminiBaseDir: path.join(tmpDir, 'no-gemini'),
+    appDataDir: path.join(tmpDir, 'no-app'),
+    inspectProcessFn: () => ({ alive: true, inspected: true, pid: 120538, conversationId: null, cwd: tmpDir }),
+  });
+  assert.equal(idleRefresh.ok, true);
+  assert.equal(idleRefresh.pane.conversation_id, 'conv-idle-preserve', 'idle FD closure on same PID must NOT drop conversation_id');
+  assert.equal(idleRefresh.pane.context.source, 'statusline', 'must preserve statusline context source');
+  assert.equal(idleRefresh.pane.context.used_tokens, 405000, 'must NOT reset context tokens to 0 while idle');
+  assert.equal(idleRefresh.pane.context.cached_pct, 99.36, 'must NOT reset cached_pct to 0 while idle');
+
+  // 3. Explicit welcome-screen /new via statusLine (conversation_id: "") DOES reset cleanly to 0
+  applyStatusLineMeta({
+    meta: {
+      conversation_id: '',
+      cwd: tmpDir,
+      model: { id: 'gemini-4-neon-high', display_name: 'Gemini 4 Neon (High)' },
+      context_window: { total_input_tokens: 0, total_output_tokens: 0, context_window_size: 1048576 },
+    },
+    pane: '0',
+    agyPid: 120538,
+    statusDir,
+    env: {},
+    nowMs: nowMs + 10000,
+  });
+  const afterNew = await runRefresh({
+    statusDir,
+    pane: '0',
+    cwd: tmpDir,
+    agyPid: 120538,
+    nowMs: nowMs + 12000,
+    env: {},
+    geminiBaseDir: path.join(tmpDir, 'no-gemini'),
+    appDataDir: path.join(tmpDir, 'no-app'),
+    inspectProcessFn: () => ({ alive: true, inspected: true, pid: 120538, conversationId: null, cwd: tmpDir }),
+  });
+  assert.equal(afterNew.pane.conversation_id, null);
+  assert.equal(afterNew.pane.context.source, 'initial');
+  assert.equal(afterNew.pane.context.used_tokens, 0);
+});
+
 
 
 

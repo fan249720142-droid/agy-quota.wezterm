@@ -130,10 +130,14 @@ export function applyStatusLineMeta({
     && Number(resolvedAgyPid) !== Number(existingEp.pid)
   );
 
-  // Strictly block empty / 'default' conversation_id from inheriting stale conversation data.
+  // Strictly block empty / 'default' conversation_id from inheriting stale conversation data
+  // when statusLine explicitly reports an empty conversation_id (e.g. blank welcome screen / /new).
   const hasConvField = Object.prototype.hasOwnProperty.call(meta || {}, 'conversation_id')
     || Object.prototype.hasOwnProperty.call(meta || {}, 'session_id');
-  const conversationId = sanitizeConversationId(meta?.conversation_id || meta?.session_id || '');
+  const rawSanitizedConvId = sanitizeConversationId(meta?.conversation_id || meta?.session_id || '');
+  const conversationId = hasConvField
+    ? rawSanitizedConvId
+    : (!pidChanged ? (existingPane?.conversation_id || null) : null);
   const prevConvId = existingPane?.conversation_id || null;
   const sessionReset = Boolean(
     pidChanged

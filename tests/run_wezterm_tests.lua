@@ -1532,6 +1532,28 @@ test("effective context_limit_mode, expired quota grace recovery, failed-poll ba
     }, now)
     assert_eq(snap_phys.context.display_window_size, 1048576, "physical mode uses context_window_size")
     assert_eq(snap_phys.context.display_used_pct, 12.21, "physical mode uses physical used_pct")
+
+    -- 3. Epoch-0 reset_time ("1970-01-01T00:00:00Z") on unused 100% pool never emits bogus "now" countdown
+    write_file(
+      tmp_dir .. "/quota.json",
+      string.format(
+        '{"version":1,"fetched_at":%d,"default_pool":"3p","pools":{"3p":{"label":"Claude/GPT","five_hour":{"remaining_pct":100,"reset_time":"1970-01-01T00:00:00Z","reset_epoch":0},"weekly":{"remaining_pct":100,"reset_epoch":0}}}}',
+        now
+      )
+    )
+    state.reset()
+    local snap_3p_zero = state.get_snapshot(pane, {
+      cache_dir = tmp_dir,
+      pool = "3p",
+      spawn_fn = function() end,
+    }, now)
+    assert_eq(snap_3p_zero.five_hour.reset_epoch, nil, "epoch-0 reset_epoch normalized to nil")
+    local lines_3p_zero = render.render_bottom_lines(snap_3p_zero, 120, {})
+    assert_eq(
+      render.cells_to_plain_text(lines_3p_zero.line2),
+      "Claude/GPT │ Five Hours 100% ██████████ │ Weekly 100% ██████████",
+      "unused 100% pool with epoch-0 reset_time omits bogus now countdown"
+    )
   end)
   remove_dir(tmp_dir)
   if not ok then

@@ -728,6 +728,10 @@ local function normalize_window(win, now, grace_secs)
   end
   local reset_time = type(win.reset_time) == "string" and win.reset_time or nil
   local reset_epoch = M.parse_epoch(win.reset_epoch) or M.parse_epoch(reset_time)
+  if type(reset_epoch) == "number" and reset_epoch <= 0 then
+    reset_epoch = nil
+    reset_time = nil
+  end
   local remaining_pct = to_number(win.remaining_pct)
   if remaining_pct then
     remaining_pct = clamp(remaining_pct, 0, 100)

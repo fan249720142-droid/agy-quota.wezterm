@@ -25,7 +25,9 @@ export function normalizeModelKey(name) {
 export function parseResetEpoch(resetTime) {
   if (!resetTime || typeof resetTime !== 'string') return null;
   const ms = Date.parse(resetTime);
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+  if (!Number.isFinite(ms)) return null;
+  const epoch = Math.floor(ms / 1000);
+  return epoch > 0 ? epoch : null;
 }
 
 export function enumIntToModelId(enumInt) {
@@ -76,6 +78,9 @@ function formatBucket(bucket, nowEpoch = Math.floor(Date.now() / 1000)) {
 
   let reset_time = rawResetTime;
   let reset_epoch = parseResetEpoch(reset_time);
+  if (reset_epoch === null) {
+    reset_time = null;
+  }
   if (reset_epoch === null && Number.isFinite(resetSec) && resetSec > 0) {
     reset_epoch = Math.floor(nowEpoch + resetSec);
     reset_time = new Date(reset_epoch * 1000).toISOString();

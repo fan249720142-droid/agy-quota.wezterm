@@ -240,9 +240,23 @@ export async function runRefresh({
       saveQuota(effectiveStatusDir, quotaPayload);
     }
 
+    const sameLivePid = Boolean(
+      !pidChanged
+      && activeLivePid
+      && existingPane?.agy_pid
+      && Number(existingPane.agy_pid) === Number(activeLivePid)
+    );
+    const samePidConvFallback = (!pidChanged && (sameLivePid || !activeLivePid))
+      ? (existingPane?.conversation_id || null)
+      : null;
+
     const paneEp = endpointsStore.endpoints[paneId];
+    // Note: when agy finishes a turn and sits idle, it closes its idle SQLite `.db` FD,
+    // so `/proc/<pid>/fd` may transiently report `liveProc.conversationId === null` on the
+    // SAME live PID. Only treat `null` as a blank welcome screen when the PID changed or
+    // no conversation was recorded on this PID yet (or statusLine explicitly cleared it).
     let conversationId = liveProc?.inspected
-      ? (explicitConversationId || liveProc.conversationId || null)
+      ? (explicitConversationId || liveProc.conversationId || samePidConvFallback || null)
       : (explicitConversationId
         || (pidChanged ? null : existingPane?.conversation_id)
         || (!pidChanged ? paneEp?.conversation_id : null)
@@ -364,9 +378,20 @@ export async function runRefresh({
     }
 
     const prevConvId = latestOnDisk?.conversation_id ?? existingPane?.conversation_id ?? null;
-    const finalConversationId = liveProc?.inspected
-      ? (conversationId || null)
-      : (conversationId || (pidChanged ? null : latestOnDisk?.conversation_id) || null);
+    const latestClearedOnSamePid = Boolean(
+      !pidChanged
+      && !explicitConversationId
+      && !(liveProc?.inspected && liveProc.conversationId)
+      && latestOnDisk
+      && latestOnDisk.conversation_id === null
+      && latestOnDisk.context?.source === 'initial'
+      && (latestOnDisk.updated_at || 0) >= (existingPane?.updated_at || 0)
+    );
+    const finalConversationId = latestClearedOnSamePid
+      ? null
+      : (liveProc?.inspected
+        ? (conversationId || null)
+        : (conversationId || (pidChanged ? null : latestOnDisk?.conversation_id) || null));
     const finalCwd = effectiveCwd || (pidChanged ? null : latestOnDisk?.cwd) || null;
 
     const sessionReset = Boolean(
@@ -438,8 +463,15 @@ export async function runRefresh({
       ? baselinePane.context.cached_pct
       : null;
 
+    const preferStatuslineOverSqlite = Boolean(
+      preservedContext
+      && preservedContext.source === 'statusline'
+      && (preservedContext.used_tokens || 0) > 0
+      && stepUsage?.source === 'sqlite'
+    );
+
     let context = null;
-    if (stepUsage) {
+    if (stepUsage && !preferStatuslineOverSqlite) {
       const physWin = stepUsage.windowSize || activeModel.context_window_size || null;
       const usedEst = (stepUsage.usage.inputTokens || 0)
         + (stepUsage.usage.cacheCreationTokens || 0)
