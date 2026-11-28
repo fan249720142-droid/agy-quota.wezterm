@@ -11,17 +11,19 @@ WEZTERM_PLUGINS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/wezterm/plugins"
 WEZTERM_PLUGIN_SRC="${SCRIPT_DIR}"
 WEZTERM_PLUGIN_DST="${WEZTERM_PLUGINS_DIR}/${PLUGIN_SLUG}"
 
+SETUP_STATUSLINE_SCRIPT="${SCRIPT_DIR}/bin/setup-statusline.mjs"
 SETTINGS_JSON="${HOME}/.gemini/antigravity-cli/settings.json"
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--uninstall] [-h|--help]
+Usage: install.sh [--no-statusline] [--uninstall] [-h|--help]
 
-Install (default) or uninstall local symlinks for agy-quota.wezterm:
+Install (default) or uninstall local symlinks and silent statusLine telemetry feeder for agy-quota.wezterm:
   1. agy-plugin -> ~/.gemini/config/plugins/agy-quota-wezterm-bridge
   2. repo root  -> ~/.local/share/wezterm/plugins/httpssCssZssZsgithubsDscomsZsfan249720142-droidsZsagy-quotasDswezterm
-
-This script never modifies ~/.gemini/antigravity-cli/settings.json (statusLine remains untouched).
+  3. statusLine -> configures silent telemetry feeder in ~/.gemini/antigravity-cli/settings.json
+                   (stack_with_default: true, empty stdout so native single-line bar stays clean;
+                    pass --no-statusline to leave settings.json untouched; --uninstall restores backup)
 EOF
 }
 
@@ -98,38 +100,18 @@ find_bin() {
   return 1
 }
 
-verify_settings_json_readonly() {
-  if [[ ! -f "$SETTINGS_JSON" ]]; then
-    echo "[INFO] ${SETTINGS_JSON} not found (not created or modified)."
+configure_statusline() {
+  local mode="$1"
+  local node_bin=""
+  if ! node_bin="$(find_bin node 2>/dev/null)"; then
+    echo "[WARN] node not found; skipping statusLine feeder setup"
     return 0
   fi
-
-  local node_bin=""
-  local status_line_state="unknown"
-  if node_bin="$(find_bin node 2>/dev/null)"; then
-    status_line_state="$("$node_bin" -e '
-      const fs = require("fs");
-      try {
-        const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        if (Object.prototype.hasOwnProperty.call(data, "statusLine")) {
-          const val = data.statusLine;
-          const kind = val === null ? "null" : typeof val;
-          console.log("present (" + kind + ")");
-        } else {
-          console.log("absent");
-        }
-      } catch (e) {
-        console.log("unreadable");
-      }
-    ' "$SETTINGS_JSON")"
-  elif grep -q '"statusLine"' "$SETTINGS_JSON" 2>/dev/null; then
-    status_line_state="present"
+  if [[ "$mode" == "uninstall" ]]; then
+    "$node_bin" "$SETUP_STATUSLINE_SCRIPT" --uninstall
   else
-    status_line_state="absent"
+    "$node_bin" "$SETUP_STATUSLINE_SCRIPT"
   fi
-
-  echo "[OK] settings.json verified read-only (never modified): ${SETTINGS_JSON}"
-  echo "     statusLine state: ${status_line_state} (coexistence preserved)"
 }
 
 check_environment() {
@@ -160,10 +142,16 @@ check_environment() {
 
 main() {
   local mode="install"
+  local with_statusline="true"
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --uninstall)
         mode="uninstall"
+        shift
+        ;;
+      --no-statusline)
+        with_statusline="false"
         shift
         ;;
       -h|--help)
@@ -179,18 +167,23 @@ main() {
   done
 
   if [[ "$mode" == "uninstall" ]]; then
-    echo "=== Uninstalling agy-quota.wezterm symlinks ==="
+    echo "=== Uninstalling agy-quota.wezterm ==="
     unlink_idempotent "$AGY_PLUGIN_SRC" "$AGY_PLUGIN_DST"
     unlink_idempotent "$WEZTERM_PLUGIN_SRC" "$WEZTERM_PLUGIN_DST"
-    verify_settings_json_readonly
+    configure_statusline uninstall
     echo "=== Uninstall complete ==="
     return 0
   fi
 
   echo "=== Installing agy-quota.wezterm ==="
+  chmod +x "${SCRIPT_DIR}/bin/agy-statusline-feeder.mjs" "${SCRIPT_DIR}/bin/setup-statusline.mjs" 2>/dev/null || true
   link_idempotent "$AGY_PLUGIN_SRC" "$AGY_PLUGIN_DST"
   link_idempotent "$WEZTERM_PLUGIN_SRC" "$WEZTERM_PLUGIN_DST"
-  verify_settings_json_readonly
+  if [[ "$with_statusline" == "true" ]]; then
+    configure_statusline install
+  else
+    echo "[INFO] --no-statusline specified; ${SETTINGS_JSON} left untouched."
+  fi
   check_environment
   echo "=== Install complete ==="
 }

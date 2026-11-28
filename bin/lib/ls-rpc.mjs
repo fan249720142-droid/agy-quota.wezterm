@@ -124,32 +124,40 @@ export async function callLsRpc(endpoint, method, body = {}, timeoutMs = 2000) {
   return { ...second, prefer_https: secondScheme === 'https' };
 }
 
+const INCREMENTAL_OFFSET_MIN = 32;
+
 /**
- * Paginate GetCascadeTrajectoryGeneratorMetadata (max 5 pages of 256).
+ * Paginate GetCascadeTrajectoryGeneratorMetadata (max 5 pages of 256) with incremental offset
+ * (for long trajectories >= 32 steps) and `includeMessages: false` to minimize payload size.
  */
-export async function fetchGeneratorMetadata(endpoint, cascadeId, timeoutMs = 2000) {
-  if (!cascadeId) return { ok: false, items: [] };
+export async function fetchGeneratorMetadata(endpoint, cascadeId, timeoutMs = 2000, { startOffset = 0 } = {}) {
+  if (!cascadeId) return { ok: false, items: [], nextOffset: 0 };
   const items = [];
-  let offset = 0;
+  const baseOffset = Math.max(0, Number(startOffset) || 0);
+  // Use incremental cursor for long conversations (>= 32 steps), re-reading the last item
+  // to catch streaming usage backfill; short conversations read from 0 in a single fast call.
+  let offset = baseOffset >= INCREMENTAL_OFFSET_MIN ? baseOffset - 1 : 0;
 
   for (let page = 0; page < MAX_PAGES; page++) {
     const res = await callLsRpc(
       endpoint,
       'GetCascadeTrajectoryGeneratorMetadata',
-      { cascadeId, generatorMetadataOffset: offset },
+      { cascadeId, generatorMetadataOffset: offset, includeMessages: false },
       timeoutMs
     );
     if (!res.ok) {
-      if (page === 0) return { ok: false, items: [], error: res.error, statusCode: res.statusCode };
+      if (page === 0) {
+        return { ok: false, items: [], nextOffset: baseOffset, error: res.error, statusCode: res.statusCode };
+      }
       break;
     }
     const batch = Array.isArray(res.data?.generatorMetadata) ? res.data.generatorMetadata : [];
     items.push(...batch);
-    if (batch.length < PAGE_SIZE) break;
     offset += batch.length;
+    if (batch.length < PAGE_SIZE) break;
   }
 
-  return { ok: true, items };
+  return { ok: true, items, nextOffset: Math.max(baseOffset, offset) };
 }
 
 /**
@@ -246,6 +254,7 @@ export function buildEndpointCandidates({
         ? Boolean(existingPaneEp?.prefer_https)
         : false,
       conversation_id: env.ANTIGRAVITY_CONVERSATION_ID || existingPaneEp?.conversation_id || null,
+      fromEnv: true,
     });
   }
 
@@ -273,8 +282,10 @@ export function buildEndpointCandidates({
 
 /**
  * Fetch quota summary, user status, and available models from the first reachable endpoint.
+ * Also reports dead/unauthorized endpoints so callers can evict stale cache entries.
  */
 export async function queryQuotaFromLs(candidates, timeoutMs = 2000) {
+  const deadKeys = [];
   for (const ep of candidates) {
     const [quotaRes, statusRes, modelsRes] = await Promise.all([
       callLsRpc(ep, 'RetrieveUserQuotaSummary', {}, timeoutMs),
@@ -292,8 +303,18 @@ export async function queryQuotaFromLs(candidates, timeoutMs = 2000) {
         quotaSummaryResp: quotaRes.ok ? quotaRes.data : null,
         userStatusResp: statusRes.ok ? statusRes.data : null,
         availableModelsResp: modelsRes.ok ? modelsRes.data : null,
+        deadKeys,
       };
     }
+
+    const allDead = [quotaRes, statusRes, modelsRes].every((r) => (
+      r.statusCode === 401
+      || r.statusCode === 403
+      || r.error?.code === 'ECONNREFUSED'
+    ));
+    if (allDead && ep.key && !ep.fromDaemon && !ep.fromEnv) {
+      deadKeys.push(ep.key);
+    }
   }
-  return { ok: false, endpoint: null };
+  return { ok: false, endpoint: null, deadKeys };
 }

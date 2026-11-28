@@ -11,6 +11,7 @@ import {
   loadModelLimitsCache,
   loadPane,
   loadQuota,
+  pruneEndpoint,
   readJsonSafe,
   releaseLock,
   resolvePaneId,
@@ -29,6 +30,7 @@ import {
 import {
   buildModelIndex,
   buildQuotaPayload,
+  resolveEffectiveContextLimit,
   resolveModelMetadata,
 } from './lib/models.mjs';
 import {
@@ -163,6 +165,17 @@ export async function runRefresh({
       && Number(activeLivePid) !== Number(existingPane.agy_pid)
     );
 
+    // Evict dead cached endpoint for this pane when PID changed without fresh env credentials.
+    if (
+      pidChanged
+      && !env.ANTIGRAVITY_LS_ADDRESS
+      && endpointsStore.endpoints[paneId]
+      && (!endpointsStore.endpoints[paneId].pid || Number(endpointsStore.endpoints[paneId].pid) !== Number(activeLivePid))
+    ) {
+      pruneEndpoint(effectiveStatusDir, paneId);
+      delete endpointsStore.endpoints[paneId];
+    }
+
     const candidates = buildEndpointCandidates({
       paneId,
       endpointsStore,
@@ -171,6 +184,12 @@ export async function runRefresh({
     });
 
     const lsQuota = await queryQuotaFromLs(candidates, rpcTimeoutMs);
+    if (Array.isArray(lsQuota.deadKeys) && lsQuota.deadKeys.length > 0) {
+      for (const deadKey of lsQuota.deadKeys) {
+        pruneEndpoint(effectiveStatusDir, deadKey);
+        delete endpointsStore.endpoints[deadKey];
+      }
+    }
 
     let quotaPayload = existingQuota;
     let modelIndex = buildModelIndex(null, [], cachedLimits);
@@ -215,6 +234,10 @@ export async function runRefresh({
         endpointsStore.endpoints[activeEp.key].updated_at = nowEpoch;
         saveEndpoints(effectiveStatusDir, endpointsStore);
       }
+    } else if (existingQuota) {
+      // Record failed attempt timestamp so WezTerm backs off instead of respawning every 2s.
+      quotaPayload = { ...existingQuota, last_poll_attempt_at: nowEpoch };
+      saveQuota(effectiveStatusDir, quotaPayload);
     }
 
     const paneEp = endpointsStore.endpoints[paneId];
@@ -231,29 +254,46 @@ export async function runRefresh({
     let stepResolved = null;
     let stepCount = 0;
     let stepUsage = null;
+    let nextGenOffset = 0;
+    let runtimeMaxContextTokens = 0;
+
+    const canReuseOffset = Boolean(
+      !pidChanged
+      && conversationId
+      && existingPane?.conversation_id === conversationId
+      && typeof existingPane?.generator_metadata_offset === 'number'
+      && existingPane.generator_metadata_offset > 0
+    );
+    const startOffset = canReuseOffset ? existingPane.generator_metadata_offset : 0;
 
     // 1. Official LS RPC trajectory usage when endpoint and conversation_id are available.
     if (lsQuota.ok && conversationId) {
-      const gmRes = await fetchGeneratorMetadata(lsQuota.endpoint, conversationId, rpcTimeoutMs);
-      if (gmRes.ok && gmRes.items.length > 0) {
-        const latestRpc = extractLatestRpcUsage(gmRes.items);
-        if (latestRpc) {
-          stepResolved = resolveModelMetadata({
-            modelId: latestRpc.model,
-            modelDisplayName: latestRpc.modelDisplayName,
-            responseModel: latestRpc.responseModel,
-            chatStartMetadata: latestRpc.chatStartMetadata,
-            modelIndex,
-            modelPools: quotaPayload?.model_pools || {},
-            defaultPool: quotaPayload?.default_pool || 'gemini',
-          });
-          stepCount = gmRes.items.length;
-          if (latestRpc.usage) {
-            stepUsage = {
-              usage: latestRpc.usage,
-              windowSize: stepResolved.context_window_size,
-              source: 'ls_rpc',
-            };
+      const gmRes = await fetchGeneratorMetadata(lsQuota.endpoint, conversationId, rpcTimeoutMs, { startOffset });
+      if (gmRes.ok) {
+        nextGenOffset = gmRes.nextOffset || 0;
+        if (gmRes.items.length > 0) {
+          const latestRpc = extractLatestRpcUsage(gmRes.items);
+          if (latestRpc) {
+            stepResolved = resolveModelMetadata({
+              modelId: latestRpc.model,
+              modelDisplayName: latestRpc.modelDisplayName,
+              responseModel: latestRpc.responseModel,
+              chatStartMetadata: latestRpc.chatStartMetadata,
+              modelIndex,
+              modelPools: quotaPayload?.model_pools || {},
+              defaultPool: quotaPayload?.default_pool || 'gemini',
+            });
+            stepCount = Math.max(gmRes.nextOffset || 0, gmRes.items.length);
+            runtimeMaxContextTokens = stepResolved.runtime_max_context_tokens || 0;
+            if (latestRpc.usage) {
+              stepUsage = {
+                usage: latestRpc.usage,
+                windowSize: stepResolved.context_window_size,
+                compactionLimit: stepResolved.compaction_limit,
+                runtimeMaxContextTokens,
+                source: 'ls_rpc',
+              };
+            }
           }
         }
       }
@@ -297,17 +337,22 @@ export async function runRefresh({
           stepResolved = sqliteResolved;
           stepCount = sqliteData.stepCount || 0;
         }
+        if (!runtimeMaxContextTokens && sqliteResolved.runtime_max_context_tokens) {
+          runtimeMaxContextTokens = sqliteResolved.runtime_max_context_tokens;
+        }
         if (sqliteData.usage) {
           stepUsage = {
             usage: sqliteData.usage,
             windowSize: sqliteResolved.context_window_size,
+            compactionLimit: sqliteResolved.compaction_limit,
+            runtimeMaxContextTokens: sqliteResolved.runtime_max_context_tokens || runtimeMaxContextTokens,
             source: 'sqlite',
           };
         }
       }
     }
 
-    // Re-read pane state on disk before saving so concurrent hook updates aren't clobbered.
+    // Re-read pane state on disk before saving so concurrent hook / statusline updates aren't clobbered.
     const latestOnDisk = loadPane(effectiveStatusDir, paneId);
     if (
       latestOnDisk?.conversation_id
@@ -380,21 +425,78 @@ export async function runRefresh({
       ? latestOnDisk.context
       : null;
 
+    const effectiveRuntimeMax = runtimeMaxContextTokens
+      || activeModel.runtime_max_context_tokens
+      || (sameConversation ? (baselinePane?.runtime_max_context_tokens || 0) : 0);
+    const catalogCompactionLimit = stepUsage?.compactionLimit || activeModel.compaction_limit || 0;
+    const prevCachedPct = (
+      sameConversation
+      && baselinePane?.context
+      && baselinePane.context.source !== 'initial'
+      && typeof baselinePane.context.cached_pct === 'number'
+    )
+      ? baselinePane.context.cached_pct
+      : null;
+
     let context = null;
     if (stepUsage) {
+      const physWin = stepUsage.windowSize || activeModel.context_window_size || null;
+      const usedEst = (stepUsage.usage.inputTokens || 0)
+        + (stepUsage.usage.cacheCreationTokens || 0)
+        + (stepUsage.usage.cacheReadTokens || 0)
+        + (stepUsage.usage.outputTokens || 0);
+      const effLimit = resolveEffectiveContextLimit({
+        usedTokens: usedEst,
+        physicalWindowSize: physWin,
+        runtimeMaxContextTokens: stepUsage.runtimeMaxContextTokens || effectiveRuntimeMax,
+        catalogCompactionLimit,
+        env,
+        rememberedCeiling: sameConversation ? (baselinePane?.context?.effective_context_limit || 0) : 0,
+      });
       context = computeContextMetrics({
         ...stepUsage.usage,
-        contextWindowSize: stepUsage.windowSize || activeModel.context_window_size || null,
+        cachedPctOverride: prevCachedPct,
+        contextWindowSize: physWin,
+        effectiveContextLimit: effLimit,
         source: stepUsage.source,
       });
     } else if (preservedContext) {
-      context = preservedContext;
+      const physWin = preservedContext.context_window_size || activeModel.context_window_size || null;
+      const effLimit = resolveEffectiveContextLimit({
+        usedTokens: preservedContext.used_tokens || 0,
+        physicalWindowSize: physWin,
+        runtimeMaxContextTokens: effectiveRuntimeMax,
+        catalogCompactionLimit,
+        env,
+        rememberedCeiling: preservedContext.effective_context_limit || 0,
+      });
+      context = computeContextMetrics({
+        inputTokens: preservedContext.input_tokens || 0,
+        outputTokens: preservedContext.output_tokens || 0,
+        cacheReadTokens: preservedContext.cache_read_tokens || 0,
+        cacheCreationTokens: preservedContext.cache_creation_tokens || 0,
+        usedTokensOverride: preservedContext.used_tokens,
+        cachedPctOverride: preservedContext.cached_pct,
+        contextWindowSize: physWin,
+        effectiveContextLimit: effLimit,
+        source: preservedContext.source,
+      });
     } else {
+      const physWin = activeModel.context_window_size || null;
+      const effLimit = resolveEffectiveContextLimit({
+        usedTokens: 0,
+        physicalWindowSize: physWin,
+        runtimeMaxContextTokens: effectiveRuntimeMax,
+        catalogCompactionLimit,
+        env,
+      });
       context = computeContextMetrics({
         inputTokens: 0,
         outputTokens: 0,
         cacheReadTokens: 0,
-        contextWindowSize: activeModel.context_window_size || null,
+        cacheCreationTokens: 0,
+        contextWindowSize: physWin,
+        effectiveContextLimit: effLimit,
         source: 'initial',
       });
     }
@@ -405,6 +507,10 @@ export async function runRefresh({
     const finalAgentState = agentStateOnDisk
       || (sameConversation ? (existingPane?.agent_state || sqliteAgentState) : sqliteAgentState)
       || 'idle';
+
+    const finalGenOffset = sameConversation
+      ? Math.max(nextGenOffset, baselinePane?.generator_metadata_offset || 0)
+      : nextGenOffset;
 
     const finalPane = {
       version: 1,
@@ -418,6 +524,8 @@ export async function runRefresh({
       pool_label: activeModel.pool_label,
       model_tracking: modelTracking,
       agent_state: finalAgentState,
+      generator_metadata_offset: finalGenOffset,
+      runtime_max_context_tokens: effectiveRuntimeMax || null,
       context,
       updated_at: nowEpoch,
     };

@@ -109,6 +109,12 @@ export function applyHookUpdate({
     && existingPane?.agy_pid
     && Number(resolvedAgyPid) !== Number(existingPane.agy_pid)
   );
+  const epPidChanged = Boolean(
+    resolvedAgyPid
+    && existingEp?.pid
+    && Number(resolvedAgyPid) !== Number(existingEp.pid)
+  );
+  const endpointStale = pidChanged || epPidChanged;
 
   const explicitConvId = payload.conversationId
     || payload.conversation_id
@@ -116,7 +122,7 @@ export function applyHookUpdate({
     || env.ANTIGRAVITY_CONVERSATION_ID
     || null;
   const conversationId = explicitConvId
-    || (pidChanged ? null : (existingPane?.conversation_id || existingEp?.conversation_id))
+    || (pidChanged ? null : (existingPane?.conversation_id || (!epPidChanged ? existingEp?.conversation_id : null)))
     || null;
 
   const cwd = payload.cwd
@@ -124,8 +130,8 @@ export function applyHookUpdate({
     || (pidChanged ? null : existingPane?.cwd)
     || process.cwd();
 
-  const lsAddress = env.ANTIGRAVITY_LS_ADDRESS || (!pidChanged ? existingEp?.ls_address : null) || null;
-  const csrfToken = env.ANTIGRAVITY_CSRF_TOKEN || (!pidChanged ? existingEp?.csrf_token : '') || '';
+  const lsAddress = env.ANTIGRAVITY_LS_ADDRESS || (!endpointStale ? existingEp?.ls_address : null) || null;
+  const csrfToken = env.ANTIGRAVITY_CSRF_TOKEN || (!endpointStale ? existingEp?.csrf_token : '') || '';
 
   if (lsAddress) {
     const preferHttps = existingEp?.ls_address === lsAddress
@@ -140,6 +146,14 @@ export function applyHookUpdate({
       updated_at: effectiveNowEpoch,
     };
     endpointsStore.latest_key = paneId;
+    saveEndpoints(statusDir, endpointsStore);
+  } else if (endpointStale && existingEp) {
+    delete endpointsStore.endpoints[paneId];
+    if (endpointsStore.latest_key === paneId) {
+      const remaining = Object.entries(endpointsStore.endpoints)
+        .sort((a, b) => (b[1]?.updated_at || 0) - (a[1]?.updated_at || 0));
+      endpointsStore.latest_key = remaining.length > 0 ? remaining[0][0] : null;
+    }
     saveEndpoints(statusDir, endpointsStore);
   }
 

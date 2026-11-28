@@ -91,13 +91,21 @@ export function ensureCacheDirs(statusDir = getStatusDir()) {
 }
 
 /**
- * Atomically write JSON via `<target>.tmp.<pid>` + rename.
+ * Strip UTF-8 BOM if present.
+ */
+export function stripUtf8Bom(text) {
+  return typeof text === 'string' ? text.replace(/^\uFEFF/, '') : '';
+}
+
+/**
+ * Atomically write JSON via `<target>.tmp.<pid>.<ts>.<rand>` + rename (strictly BOM-free).
  */
 export function atomicWriteJson(filePath, data, mode = 0o644) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const tmpPath = `${filePath}.tmp.${process.pid}`;
-  const payload = JSON.stringify(data, null, 2) + '\n';
+  const rand = Math.random().toString(36).slice(2, 8);
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${rand}`;
+  const payload = stripUtf8Bom(JSON.stringify(data, null, 2) + '\n');
   try {
     fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode });
     fs.chmodSync(tmpPath, mode);
@@ -113,14 +121,31 @@ export function atomicWriteJson(filePath, data, mode = 0o644) {
 }
 
 /**
- * Read and parse JSON from disk, returning null on missing or invalid JSON.
+ * Read and parse JSON from disk (stripping any UTF-8 BOM), returning null on missing or invalid JSON.
  */
 export function readJsonSafe(filePath) {
   try {
-    const raw = fs.readFileSync(filePath, 'utf8');
+    const raw = stripUtf8Bom(fs.readFileSync(filePath, 'utf8'));
     if (!raw.trim()) return null;
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : null;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read a JSON object file with BOM defense:
+ * - missing or empty file -> `{}`
+ * - invalid JSON or non-object -> `null` (so callers can refuse to overwrite corrupted settings)
+ */
+export function readJsonObjectWithBomDefense(filePath) {
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    const raw = stripUtf8Bom(fs.readFileSync(filePath, 'utf8'));
+    if (!raw.trim()) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -236,6 +261,25 @@ export function loadEndpoints(statusDir) {
 export function saveEndpoints(statusDir, data) {
   ensureCacheDirs(statusDir);
   atomicWriteJson(getEndpointsPath(statusDir), data, 0o600);
+}
+
+/**
+ * Remove a stale or dead LS endpoint entry by key and update `latest_key`.
+ */
+export function pruneEndpoint(statusDir, key) {
+  if (!key) return false;
+  const store = loadEndpoints(statusDir);
+  if (!store.endpoints || !Object.prototype.hasOwnProperty.call(store.endpoints, key)) {
+    return false;
+  }
+  delete store.endpoints[key];
+  if (store.latest_key === key) {
+    const remaining = Object.entries(store.endpoints)
+      .sort((a, b) => (b[1]?.updated_at || 0) - (a[1]?.updated_at || 0));
+    store.latest_key = remaining.length > 0 ? remaining[0][0] : null;
+  }
+  saveEndpoints(statusDir, store);
+  return true;
 }
 
 export function loadPane(statusDir, paneId) {

@@ -27,7 +27,17 @@ import {
 import { callLsRpc, discoverDaemonHubEndpoints } from '../bin/lib/ls-rpc.mjs';
 import { applyHookUpdate, deriveAgentState } from '../bin/lib/hook-handler.mjs';
 import { resolveCliSettingsPath } from '../bin/lib/model-tracking.mjs';
-import { buildQuotaPayload, classifyPoolByKeywords } from '../bin/lib/models.mjs';
+import {
+  buildModelIndex,
+  buildQuotaPayload,
+  classifyPoolByKeywords,
+  mergeQuotaPools,
+  mergeQuotaWindow,
+  parseMetaQuotaToPools,
+  resolveEffectiveContextLimit,
+} from '../bin/lib/models.mjs';
+import { applyStatusLineMeta } from '../bin/lib/statusline-feeder.mjs';
+import { installStatusLineFeeder, uninstallStatusLineFeeder } from '../bin/setup-statusline.mjs';
 import {
   decodeGeneratorMetadataProto,
   getCandidateAppDataDirs,
@@ -1883,6 +1893,326 @@ test('Linux /proc live helpers parse ancestor PID, TTY PID, LS log ports, and op
   assert.deepEqual(inspectAgyProcess(300, { procRoot }), { alive: false, inspected: false });
   assert.deepEqual(inspectAgyProcess(999999, { procRoot }), { alive: false, inspected: false });
 });
+
+test('Silent statusLine feeder ingests meta.quota, effective ceiling, cache_creation_input_tokens, and stays stdout-silent', async (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const statusDir = path.join(tmpDir, 'status');
+  const feederPath = path.join(REPO_ROOT, 'bin', 'agy-statusline-feeder.mjs');
+  const fakeCollector = path.join(tmpDir, 'noop-collector.mjs');
+  fs.writeFileSync(fakeCollector, 'process.exit(0);\n');
+
+  const meta1 = {
+    conversation_id: 'conv-sl-1',
+    cwd: '/home/xiaolu/proj',
+    model: { id: 'claude-opus-5-5-high', display_name: 'Claude Opus 5.5 (High)' },
+    agent_state: 'working',
+    plan_tier: 'Google AI Pro',
+    context_window: {
+      total_input_tokens: 128000,
+      total_output_tokens: 3000,
+      context_window_size: 1000000,
+      current_usage: {
+        input_tokens: 10000,
+        cache_creation_input_tokens: 10000,
+        cache_read_input_tokens: 80000,
+        output_tokens: 500,
+      },
+    },
+    quota: {
+      '3p-5h': { remaining_fraction: 0.62, reset_in_seconds: 7200 },
+      '3p-weekly': { remaining_fraction: 0.88, reset_in_seconds: 300000 },
+      'argon-wtu': { remaining_fraction: 0.1, reset_in_seconds: 3600 },
+    },
+  };
+
+  const proc1 = await runChildAsync(process.execPath, [feederPath], {
+    input: '\uFEFF' + JSON.stringify(meta1),
+    env: {
+      ...process.env,
+      WEZTERM_AGY_STATUS_DIR: statusDir,
+      WEZTERM_AGY_COLLECTOR_BIN: fakeCollector,
+      WEZTERM_PANE: '7',
+      ANTIGRAVITY_LS_ADDRESS: 'localhost:41234',
+      ANTIGRAVITY_CSRF_TOKEN: 'sl-secret-csrf',
+    },
+  });
+  assert.equal(proc1.status, 0);
+  assert.equal(proc1.stdout, '');
+
+  const quota1 = readJsonSafe(getQuotaPath(statusDir));
+  assert.equal(quota1.source, 'statusline');
+  assert.equal(quota1.plan_tier, 'Google AI Pro');
+  assert.equal(quota1.pools['3p'].five_hour.remaining_pct, 62);
+  assert.equal(quota1.pools['3p'].weekly.remaining_pct, 88);
+  assert.equal('argon' in quota1.pools, false, 'argon-wtu must be filtered out');
+
+  const ep1 = readJsonSafe(getEndpointsPath(statusDir));
+  assert.equal(ep1.endpoints['7'].ls_address, 'localhost:41234');
+  assert.equal(ep1.endpoints['7'].csrf_token, 'sl-secret-csrf');
+  assert.equal(fs.statSync(getEndpointsPath(statusDir)).mode & 0o777, 0o600);
+
+  const pane7 = readJsonSafe(getPanePath(statusDir, '7'));
+  assert.equal(pane7.pool, '3p');
+  assert.equal(pane7.context.source, 'statusline');
+  assert.equal(pane7.context.used_tokens, 128000);
+  assert.equal(pane7.context.context_window_size, 1000000);
+  assert.equal(pane7.context.effective_context_limit, 256000);
+  assert.equal(pane7.context.effective_used_pct, 50);
+  // 80000 / (10000 + 10000 + 80000) = 80%
+  assert.equal(pane7.context.cached_pct, 80);
+
+  // Streaming transient with current_usage = null preserves cached_pct = 80 instead of flickering to 0%
+  const r2 = applyStatusLineMeta({
+    meta: {
+      ...meta1,
+      agent_state: 'idle',
+      context_window: {
+        total_input_tokens: 130000,
+        total_output_tokens: 3500,
+        context_window_size: 1000000,
+        current_usage: null,
+      },
+    },
+    pane: '7',
+    statusDir,
+    env: {},
+  });
+  assert.equal(r2.pane.context.cached_pct, 80);
+  assert.equal(r2.pane.agent_state, 'idle');
+
+  // Empty conversation_id resets to clean welcome-screen zero state (no cross-session leakage)
+  const rWelcome = applyStatusLineMeta({
+    meta: {
+      conversation_id: '',
+      cwd: '/home/xiaolu',
+      model: { id: 'gemini-4-neon-high', display_name: 'Gemini 4 Neon (High)' },
+      context_window: { total_input_tokens: 0, total_output_tokens: 0, context_window_size: 1048576 },
+    },
+    pane: '7',
+    statusDir,
+    env: {},
+  });
+  assert.equal(rWelcome.pane.conversation_id, null);
+  assert.equal(rWelcome.pane.context.source, 'initial');
+  assert.equal(rWelcome.pane.context.used_tokens, 0);
+});
+
+test('Dead endpoint eviction stops zombie port resurrection on PID change and records failed poll backoff', async (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const statusDir = path.join(tmpDir, 'status');
+  const nowEpoch = Math.floor(Date.now() / 1000);
+
+  // Seed yesterday's dead endpoint (PID 111) + stale quota + pane already updated to new PID 222
+  fs.mkdirSync(path.join(statusDir, 'panes'), { recursive: true });
+  fs.writeFileSync(
+    getEndpointsPath(statusDir),
+    JSON.stringify({
+      endpoints: {
+        '0': {
+          ls_address: '127.0.0.1:1',
+          csrf_token: 'dead-token',
+          prefer_https: false,
+          conversation_id: 'old-conv',
+          pid: 111,
+          updated_at: nowEpoch - 3600,
+        },
+      },
+      latest_key: '0',
+    }),
+    { mode: 0o600 }
+  );
+  fs.writeFileSync(
+    getPanePath(statusDir, '0'),
+    JSON.stringify({
+      version: 1,
+      pane_id: '0',
+      agy_pid: 222,
+      conversation_id: 'new-conv',
+      updated_at: nowEpoch,
+    })
+  );
+  fs.writeFileSync(
+    getQuotaPath(statusDir),
+    JSON.stringify({
+      version: 1,
+      fetched_at: nowEpoch - 5000,
+      source: 'ls_rpc',
+      default_pool: 'gemini',
+      pools: { gemini: { label: 'Gemini', five_hour: { remaining_pct: 5, reset_epoch: nowEpoch - 1000 }, weekly: { remaining_pct: 73, reset_epoch: nowEpoch + 100000 } } },
+    })
+  );
+
+  // 1. Hook without ANTIGRAVITY_LS_ADDRESS when existingEp.pid (111) !== resolvedAgyPid (222) MUST evict dead endpoint!
+  applyHookUpdate({
+    hookEvent: 'PostToolUse',
+    payload: { conversationId: 'new-conv', cwd: tmpDir },
+    pane: '0',
+    agyPid: 222,
+    env: {},
+    statusDir,
+  });
+  const epAfterHook = readJsonSafe(getEndpointsPath(statusDir));
+  assert.equal(epAfterHook.endpoints['0'], undefined, 'dead endpoint must be evicted instead of re-stamped with PID 222');
+
+  // 2. Re-seed a dead endpoint returning HTTP 401 and verify runRefresh prunes it and records last_poll_attempt_at
+  const authFailMock = await startMockLsServer(() => ({ status: 401, body: { error: 'unauthorized' } }));
+  t.after(() => authFailMock.close());
+  fs.writeFileSync(
+    getEndpointsPath(statusDir),
+    JSON.stringify({
+      endpoints: {
+        '0': {
+          ls_address: authFailMock.address,
+          csrf_token: 'stale-csrf',
+          prefer_https: false,
+          pid: 222,
+          updated_at: nowEpoch,
+        },
+      },
+      latest_key: '0',
+    }),
+    { mode: 0o600 }
+  );
+
+  await runRefresh({
+    statusDir,
+    pane: '0',
+    cwd: tmpDir,
+    agyPid: 222,
+    env: {},
+    geminiBaseDir: path.join(tmpDir, 'no-gemini'),
+    appDataDir: path.join(tmpDir, 'no-app'),
+    nowMs: (nowEpoch + 10) * 1000,
+  });
+  const epAfterRefresh = readJsonSafe(getEndpointsPath(statusDir));
+  assert.equal(epAfterRefresh.endpoints['0'], undefined, 'HTTP 401 endpoint must be pruned');
+  const quotaAfterRefresh = readJsonSafe(getQuotaPath(statusDir));
+  assert.equal(quotaAfterRefresh.last_poll_attempt_at, nowEpoch + 10, 'failed poll attempt timestamp persisted for backoff');
+});
+
+test('4-layer effective compaction ceiling, checkpointer model_limits parsing, and quota bucket merging work cleanly', () => {
+  const index = buildModelIndex({
+    response: {
+      models: {
+        'gemini-4-neon-high': {
+          displayName: 'Gemini 4 Neon (High)',
+          model: 'MODEL_PLACEHOLDER_M532',
+          maxTokens: 1048576,
+          modelExperiments: {
+            experiments: {
+              CASCADE_USE_EXPERIMENT_CHECKPOINTER: {
+                stringValue: JSON.stringify({ enabled: true, max_token_limit: '512000' }),
+              },
+            },
+          },
+        },
+        'claude-opus-5-5-high': {
+          displayName: 'Claude Opus 5.5 (High)',
+          model: 'MODEL_PLACEHOLDER_M402',
+          maxTokens: 1000000,
+          modelExperiments: {
+            experiments: {
+              CASCADE_USE_EXPERIMENT_CHECKPOINTER: {
+                stringValue: JSON.stringify({ enabled: true, max_token_limit: '256000' }),
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  assert.equal(index.compactionByKey.gemini4neonhigh, 512000);
+  assert.equal(index.compactionByKey.claudeopus55high, 256000);
+
+  // Layer 1b env override beats catalog & runtime
+  assert.equal(
+    resolveEffectiveContextLimit({
+      usedTokens: 100000,
+      physicalWindowSize: 1048576,
+      runtimeMaxContextTokens: 512000,
+      catalogCompactionLimit: 256000,
+      env: { AGY_TOKEN_CEILING: '300k' },
+    }),
+    300000
+  );
+  // Layer 3 catalog 256k steps up to 512k when usedTokens > 256k
+  assert.equal(
+    resolveEffectiveContextLimit({
+      usedTokens: 300000,
+      physicalWindowSize: 1000000,
+      catalogCompactionLimit: 256000,
+      env: {},
+    }),
+    512000
+  );
+
+  // Expired window yields to newer incoming window; expired incoming cannot overwrite valid future window
+  const now = 2000000000;
+  const yielded = mergeQuotaWindow(
+    { remaining_pct: 5, reset_epoch: now - 3600 },
+    { remaining_pct: 86, reset_epoch: now + 7200 },
+    { isWeekly: false, nowEpoch: now, preferLowerWhenSameReset: true }
+  );
+  assert.equal(yielded.remaining_pct, 86);
+
+  const protectedFuture = mergeQuotaWindow(
+    { remaining_pct: 86, reset_epoch: now + 7200 },
+    { remaining_pct: 5, reset_epoch: now - 3600 },
+    { isWeekly: false, nowEpoch: now, preferLowerWhenSameReset: true }
+  );
+  assert.equal(protectedFuture.remaining_pct, 86);
+
+  const parsedMeta = parseMetaQuotaToPools({
+    'gemini-5h': { remaining_fraction: 0.85, reset_in_seconds: 5400 },
+    'gemini-weekly': { remaining_fraction: 0.69, reset_in_seconds: 400000 },
+  }, now);
+  const merged = mergeQuotaPools({}, parsedMeta, { nowEpoch: now });
+  assert.equal(merged.gemini.five_hour.remaining_pct, 85);
+  assert.equal(merged.gemini.weekly.remaining_pct, 69);
+});
+
+test('setup-statusline.mjs atomically installs, backs up, and restores settings.json without touching other keys', (t) => {
+  const tmpDir = makeTempDir();
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const fakeHome = path.join(tmpDir, 'home');
+  const cliDir = path.join(fakeHome, '.gemini', 'antigravity-cli');
+  fs.mkdirSync(cliDir, { recursive: true });
+  const settingsPath = path.join(cliDir, 'settings.json');
+  const statusDir = path.join(tmpDir, 'status');
+
+  // Seed existing settings.json with UTF-8 BOM + prior custom statusLine + unrelated keys
+  fs.writeFileSync(
+    settingsPath,
+    '\uFEFF' + JSON.stringify({
+      model: 'Gemini 4 Neon (High)',
+      permissions: { allow: ['command(ls)'] },
+      statusLine: { enabled: true, type: 'command', command: '/old/status.sh' },
+    }, null, 2)
+  );
+
+  const installRes = installStatusLineFeeder({ homeDir: fakeHome, statusDir, quiet: true });
+  assert.equal(installRes.dryRun, false);
+  const rawAfterInstall = fs.readFileSync(settingsPath);
+  assert.equal(rawAfterInstall[0] === 0xef && rawAfterInstall[1] === 0xbb && rawAfterInstall[2] === 0xbf, false, 'BOM stripped');
+  const afterInstall = JSON.parse(rawAfterInstall.toString('utf8'));
+  assert.equal(afterInstall.model, 'Gemini 4 Neon (High)');
+  assert.deepEqual(afterInstall.permissions, { allow: ['command(ls)'] });
+  assert.equal(afterInstall.statusLine.stack_with_default, true);
+  assert.ok(afterInstall.statusLine.command.includes('agy-statusline-feeder.mjs'));
+
+  // Uninstall restores previous statusLine verbatim
+  const uninstallRes = uninstallStatusLineFeeder({ homeDir: fakeHome, statusDir, quiet: true });
+  assert.equal(uninstallRes.action, 'restored');
+  const afterUninstall = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.deepEqual(afterUninstall.statusLine, { enabled: true, type: 'command', command: '/old/status.sh' });
+  assert.equal(afterUninstall.model, 'Gemini 4 Neon (High)');
+});
+
 
 
 

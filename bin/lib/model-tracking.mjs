@@ -235,6 +235,8 @@ export function resolveActiveModelState({
       pool,
       pool_label: getPoolLabel(pool),
       context_window_size: null,
+      compaction_limit: null,
+      runtime_max_context_tokens: null,
       winning_source: null,
     };
   }
@@ -247,6 +249,8 @@ export function resolveActiveModelState({
       pool,
       pool_label: stepResolved.pool_label || getPoolLabel(pool),
       context_window_size: stepResolved.context_window_size || null,
+      compaction_limit: stepResolved.compaction_limit || null,
+      runtime_max_context_tokens: stepResolved.runtime_max_context_tokens || null,
       winning_source: 'rpc',
     };
   }
@@ -267,6 +271,8 @@ export function resolveActiveModelState({
     pool: resolved.pool,
     pool_label: resolved.pool_label || getPoolLabel(resolved.pool),
     context_window_size: resolved.context_window_size || null,
+    compaction_limit: resolved.compaction_limit || null,
+    runtime_max_context_tokens: resolved.runtime_max_context_tokens || null,
     winning_source: winning.source,
   };
 }
